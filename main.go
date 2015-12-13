@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/tsileo/docstore-client"
@@ -90,6 +90,7 @@ func newAbbrev(data []string) *Abbrev {
 }
 
 func main() {
+	commentLine, _ := regexp.Compile("(?m)^#.+\n")
 	// TODO(tsileo) config file with server address and collection name
 	col := docstore.New("").Col("blobs-cli-alpha")
 	flag.Usage = Usage
@@ -154,7 +155,7 @@ func main() {
 		if err != nil {
 			panic(fmt.Sprintf("failed to open temp file: %s", err))
 		}
-		data = bytes.Replace(data, noteHeader, []byte(""), 1)
+		data = commentLine.ReplaceAll(data, []byte(""))
 		log.Printf("data=%s", data)
 		// TODO(tsileo) actually save note
 	default:
