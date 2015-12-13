@@ -1,14 +1,30 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/tsileo/docstore-client"
 )
+
+var noteHeader = []byte("\n# Please write your note. Lines starting with # will be ignored.")
+
+// TempFileName generates a temporary filename for use in testing or whatever
+func TempFileName(prefix, suffix string) string {
+	randBytes := make([]byte, 16)
+	rand.Read(randBytes)
+	return filepath.Join(os.TempDir(), prefix+hex.EncodeToString(randBytes)+suffix)
+}
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -17,7 +33,17 @@ var Usage = func() {
 }
 
 type TodoItem struct {
-	Tittle string `json:"title"`
+	Title string `json:"title"`
+	Done  bool   `json:"done"`
+}
+
+// Reverse returns its argument string reversed rune-wise left to right.
+func Reverse(s string) string {
+	r := []rune(s)
+	for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	return string(r)
 }
 
 type Abbrev struct {
@@ -26,13 +52,13 @@ type Abbrev struct {
 }
 
 func (a *Abbrev) ShortID(id string) (string, bool) {
-	short, ok := a.irefs[id]
+	short, ok := a.irefs[Reverse(id)]
 	return short, ok
 }
 
 func (a *Abbrev) ID(short string) (string, bool) {
 	id, ok := a.refs[short]
-	return id, ok
+	return Reverse(id), ok
 }
 
 func countprefix(data []string, prefix string) (cnt int) {
@@ -45,6 +71,7 @@ func countprefix(data []string, prefix string) (cnt int) {
 }
 
 func newAbbrev(data []string) *Abbrev {
+	// TODO(tsileo) reverse data here in a new slice
 	irefs := map[string]string{}
 	refs := map[string]string{}
 	for _, word := range data {
@@ -80,9 +107,15 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+			ids := []string{}
 			// FIXME(tsileo) add Abbrev here, do a first pass before displaying
 			for _, todo := range todos {
-				fmt.Printf("%v\n", todo["title"])
+				ids = append(ids, Reverse(todo["_id"].(string)))
+			}
+			abbrev := newAbbrev(ids)
+			for _, todo := range todos {
+				shortID, _ := abbrev.ShortID(todo["_id"].(string))
+				fmt.Printf("%v\t%v\n", shortID, todo["title"])
 			}
 			return
 		}
@@ -90,13 +123,40 @@ func main() {
 		text := strings.Join(os.Args[2:], " ")
 		fmt.Printf("new todo: %v", text)
 		// FIXME(ts) make docstore-cli accept struct and convert them to JSOM
-		todo := &TodoItem{text}
+		todo := &TodoItem{
+			Title: text,
+			Done:  false,
+		}
 		js, _ := json.Marshal(todo)
 		id, err := col.InsertRaw(js, nil)
 		if err != nil {
 			panic(err)
 		}
 		fmt.Print(id)
+	case "note":
+		fpath := TempFileName("blobs_note_", "")
+		if err := ioutil.WriteFile(fpath, noteHeader, 0644); err != nil {
+			panic(fmt.Sprintf("failed to create temp file: %s", err))
+		}
+		defer os.Remove(fpath)
+		cmd := exec.Command("vim", fpath)
+		// Hook vim to the current session
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			panic(fmt.Sprintf("failed to start vim: %s", err))
+		}
+		if err := cmd.Wait(); err != nil {
+			panic(fmt.Sprintf("failed to edit: %s", err))
+		}
+		data, err := ioutil.ReadFile(fpath)
+		if err != nil {
+			panic(fmt.Sprintf("failed to open temp file: %s", err))
+		}
+		data = bytes.Replace(data, noteHeader, []byte(""), 1)
+		log.Printf("data=%s", data)
+		// TODO(tsileo) actually save note
 	default:
 		Usage()
 	}
