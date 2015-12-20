@@ -32,9 +32,16 @@ var Usage = func() {
 	flag.PrintDefaults()
 }
 
+type NoteItem struct {
+	Title   string `json:"title"`
+	Content string `json:"content"`
+	Kind    string `json:"_kind"`
+}
+
 type TodoItem struct {
 	Title string `json:"title"`
 	Done  bool   `json:"done"`
+	Kind  string `json:"_kind"`
 }
 
 // Reverse returns its argument string reversed rune-wise left to right.
@@ -70,6 +77,8 @@ func countprefix(data []string, prefix string) (cnt int) {
 	return
 }
 
+// FIXME(tsileo) bugfix abbreviation when len(data) == 1
+
 func newAbbrev(data []string) *Abbrev {
 	// TODO(tsileo) reverse data here in a new slice
 	irefs := map[string]string{}
@@ -102,23 +111,57 @@ func main() {
 	}
 
 	switch flag.Arg(0) {
+	case "ls":
+		items, err := col.Iter(nil)
+		if err != nil {
+			panic(err)
+		}
+		ids := []string{}
+		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
+		for _, item := range items {
+			ids = append(ids, Reverse(item["_id"].(string)))
+		}
+		abbrev := newAbbrev(ids)
+		for _, item := range items {
+			shortID, _ := abbrev.ShortID(item["_id"].(string))
+			fmt.Printf("%v\t%v\t%v\n", shortID, item["_kind"].(string), item["title"])
+		}
+
 	case "todo":
+		todos, err := col.Iter(map[string]interface{}{
+			"done": false,
+			// "_kind": "todo",
+		})
+		if err != nil {
+			panic(err)
+		}
+		ids := []string{}
+		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
+		for _, todo := range todos {
+			ids = append(ids, Reverse(todo["_id"].(string)))
+		}
+		abbrev := newAbbrev(ids)
 		if flag.NArg() == 1 {
-			todos, err := col.Iter(nil)
-			if err != nil {
-				panic(err)
-			}
-			ids := []string{}
-			// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-			for _, todo := range todos {
-				ids = append(ids, Reverse(todo["_id"].(string)))
-			}
-			abbrev := newAbbrev(ids)
 			for _, todo := range todos {
 				shortID, _ := abbrev.ShortID(todo["_id"].(string))
 				fmt.Printf("%v\t%v\n", shortID, todo["title"])
 			}
 			return
+		}
+		if flag.Arg(1) == "done" {
+			todoArg := flag.Arg(2)
+			if todoID, ok := abbrev.ID(todoArg); ok {
+				fmt.Printf("will set to ture: %v", todoID)
+				if err := col.UpdateID(todoID, map[string]interface{}{
+					"$set": map[string]interface{}{
+						"done": true,
+					},
+				}); err != nil {
+					panic(err)
+				}
+				fmt.Printf("Task done")
+				return
+			}
 		}
 		// Rebuid the todo item from args
 		text := strings.Join(os.Args[2:], " ")
@@ -127,6 +170,7 @@ func main() {
 		todo := &TodoItem{
 			Title: text,
 			Done:  false,
+			Kind:  "todo",
 		}
 		js, _ := json.Marshal(todo)
 		id, err := col.InsertRaw(js, nil)
@@ -135,6 +179,41 @@ func main() {
 		}
 		fmt.Print(id)
 	case "note":
+		if flag.NArg() >= 1 {
+			notes, err := col.Iter(map[string]interface{}{
+				"_kind": "note",
+			})
+			if err != nil {
+				panic(err)
+			}
+			ids := []string{}
+			// FIXME(tsileo) add Abbrev here, do a first pass before displaying
+			for _, note := range notes {
+				ids = append(ids, Reverse(note["_id"].(string)))
+			}
+			abbrev := newAbbrev(ids)
+			if flag.NArg() == 1 {
+				for _, note := range notes {
+					shortID, _ := abbrev.ShortID(note["_id"].(string))
+					fmt.Printf("%v\t%v\n", shortID, note["title"])
+				}
+				return
+			}
+			if flag.Arg(1) == "view" {
+				noteArg := flag.Arg(2)
+				if noteID, ok := abbrev.ID(noteArg); ok {
+					note := map[string]interface{}{}
+					if err := col.Get(noteID, &note); err != nil {
+						panic(err)
+					}
+					fmt.Printf("Title: %s\n", note["title"])
+					fmt.Printf("%s", note["content"])
+					return
+				}
+				return
+			}
+		}
+		title := strings.Join(os.Args[2:], " ")
 		fpath := TempFileName("blobs_note_", "")
 		if err := ioutil.WriteFile(fpath, noteHeader, 0644); err != nil {
 			panic(fmt.Sprintf("failed to create temp file: %s", err))
@@ -157,6 +236,17 @@ func main() {
 		}
 		data = commentLine.ReplaceAll(data, []byte(""))
 		log.Printf("data=%s", data)
+		note := &NoteItem{
+			Title:   title,
+			Content: string(data),
+			Kind:    "note",
+		}
+		js, _ := json.Marshal(note)
+		id, err := col.InsertRaw(js, nil)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Print(id)
 		// TODO(tsileo) actually save note
 	default:
 		Usage()
