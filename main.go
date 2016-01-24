@@ -6,20 +6,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
-	"github.com/tsileo/docstore-client"
+	"github.com/tsileo/blobstash/client/docstore"
 )
 
 var noteHeader = []byte("\n# Please write your note. Lines starting with # will be ignored.")
 
-// TempFileName generates a temporary filename for use in testing or whatever
+// TempFileName generates a temporary filename
 func TempFileName(prefix, suffix string) string {
 	randBytes := make([]byte, 16)
 	rand.Read(randBytes)
@@ -80,6 +76,16 @@ func countprefix(data []string, prefix string) (cnt int) {
 // FIXME(tsileo) bugfix abbreviation when len(data) == 1
 
 func newAbbrev(data []string) *Abbrev {
+	if len(data) == 1 {
+		return &Abbrev{
+			irefs: map[string]string{
+				data[0]: string(data[0][len(data[0])-1]),
+			},
+			refs: map[string]string{
+				string(data[0][len(data[0])-1]): data[0],
+			},
+		}
+	}
 	// TODO(tsileo) reverse data here in a new slice
 	irefs := map[string]string{}
 	refs := map[string]string{}
@@ -99,9 +105,9 @@ func newAbbrev(data []string) *Abbrev {
 }
 
 func main() {
-	commentLine, _ := regexp.Compile("(?m)^#.+\n")
+	// commentLine, _ := regexp.Compile("(?m)^#.+\n")
 	// TODO(tsileo) config file with server address and collection name
-	col := docstore.New("").Col("blobs-cli-alpha")
+	col := docstore.New(docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))).Col("blobs-cli-alpha")
 	flag.Usage = Usage
 	flag.Parse()
 
@@ -111,40 +117,52 @@ func main() {
 	}
 
 	switch flag.Arg(0) {
-	case "ls":
-		items, err := col.Iter(nil)
-		if err != nil {
-			panic(err)
-		}
-		ids := []string{}
-		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-		for _, item := range items {
-			ids = append(ids, Reverse(item["_id"].(string)))
-		}
-		abbrev := newAbbrev(ids)
-		for _, item := range items {
-			shortID, _ := abbrev.ShortID(item["_id"].(string))
-			fmt.Printf("%v\t%v\t%v\n", shortID, item["_kind"].(string), item["title"])
-		}
+	// case "ls":
+	// 	items, err := col.Iter(nil)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	ids := []string{}
+	// 	// FIXME(tsileo) add Abbrev here, do a first pass before displaying
+	// 	for _, item := range items {
+	// 		ids = append(ids, Reverse(item["_id"].(string)))
+	// 	}
+	// 	abbrev := newAbbrev(ids)
+	// 	for _, item := range items {
+	// 		shortID, _ := abbrev.ShortID(item["_id"].(string))
+	// 		fmt.Printf("%v\t%v\t%v\n", shortID, item["_kind"].(string), item["title"])
+	// 	}
 
 	case "todo":
-		todos, err := col.Iter(map[string]interface{}{
-			"done": false,
-			// "_kind": "todo",
-		})
+		// todos := []*TodoItem{}
+		todos := []map[string]interface{}{}
+		q := map[string]interface{}{
+			"done":  false,
+			"_kind": "todo",
+		}
+		citer, err := col.Iter(q, nil)
 		if err != nil {
 			panic(err)
 		}
+		tmp := []map[string]interface{}{}
+		for citer.Next(&tmp) {
+			todos = append(todos, tmp...)
+		}
+		if err := citer.Err(); err != nil {
+			panic(err)
+		}
+		// FIXME(tsileo): test the itearator API and see if it looks natural
 		ids := []string{}
 		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
 		for _, todo := range todos {
 			ids = append(ids, Reverse(todo["_id"].(string)))
 		}
 		abbrev := newAbbrev(ids)
+		fmt.Sprintf("abbrev:%+v", abbrev)
 		if flag.NArg() == 1 {
 			for _, todo := range todos {
 				shortID, _ := abbrev.ShortID(todo["_id"].(string))
-				fmt.Printf("%v\t%v\n", shortID, todo["title"])
+				fmt.Printf("%v\t%v\t%v\n", shortID, todo["title"], todo)
 			}
 			return
 		}
@@ -173,81 +191,79 @@ func main() {
 			Kind:  "todo",
 		}
 		js, _ := json.Marshal(todo)
-		id, err := col.InsertRaw(js, nil)
-		if err != nil {
+		if err := col.Insert(js, nil); err != nil {
 			panic(err)
 		}
-		fmt.Print(id)
-	case "note":
-		if flag.NArg() >= 1 {
-			notes, err := col.Iter(map[string]interface{}{
-				"_kind": "note",
-			})
-			if err != nil {
-				panic(err)
-			}
-			ids := []string{}
-			// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-			for _, note := range notes {
-				ids = append(ids, Reverse(note["_id"].(string)))
-			}
-			abbrev := newAbbrev(ids)
-			if flag.NArg() == 1 {
-				for _, note := range notes {
-					shortID, _ := abbrev.ShortID(note["_id"].(string))
-					fmt.Printf("%v\t%v\n", shortID, note["title"])
-				}
-				return
-			}
-			if flag.Arg(1) == "view" {
-				noteArg := flag.Arg(2)
-				if noteID, ok := abbrev.ID(noteArg); ok {
-					note := map[string]interface{}{}
-					if err := col.Get(noteID, &note); err != nil {
-						panic(err)
-					}
-					fmt.Printf("Title: %s\n", note["title"])
-					fmt.Printf("%s", note["content"])
-					return
-				}
-				return
-			}
-		}
-		title := strings.Join(os.Args[2:], " ")
-		fpath := TempFileName("blobs_note_", "")
-		if err := ioutil.WriteFile(fpath, noteHeader, 0644); err != nil {
-			panic(fmt.Sprintf("failed to create temp file: %s", err))
-		}
-		defer os.Remove(fpath)
-		cmd := exec.Command("vim", fpath)
-		// Hook vim to the current session
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			panic(fmt.Sprintf("failed to start vim: %s", err))
-		}
-		if err := cmd.Wait(); err != nil {
-			panic(fmt.Sprintf("failed to edit: %s", err))
-		}
-		data, err := ioutil.ReadFile(fpath)
-		if err != nil {
-			panic(fmt.Sprintf("failed to open temp file: %s", err))
-		}
-		data = commentLine.ReplaceAll(data, []byte(""))
-		log.Printf("data=%s", data)
-		note := &NoteItem{
-			Title:   title,
-			Content: string(data),
-			Kind:    "note",
-		}
-		js, _ := json.Marshal(note)
-		id, err := col.InsertRaw(js, nil)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Print(id)
-		// TODO(tsileo) actually save note
+	// case "note":
+	// 	if flag.NArg() >= 1 {
+	// 		notes, err := col.Iter(map[string]interface{}{
+	// 			"_kind": "note",
+	// 		})
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
+	// 		ids := []string{}
+	// 		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
+	// 		for _, note := range notes {
+	// 			ids = append(ids, Reverse(note["_id"].(string)))
+	// 		}
+	// 		abbrev := newAbbrev(ids)
+	// 		if flag.NArg() == 1 {
+	// 			for _, note := range notes {
+	// 				shortID, _ := abbrev.ShortID(note["_id"].(string))
+	// 				fmt.Printf("%v\t%v\n", shortID, note["title"])
+	// 			}
+	// 			return
+	// 		}
+	// 		if flag.Arg(1) == "view" {
+	// 			noteArg := flag.Arg(2)
+	// 			if noteID, ok := abbrev.ID(noteArg); ok {
+	// 				note := map[string]interface{}{}
+	// 				if err := col.Get(noteID, &note); err != nil {
+	// 					panic(err)
+	// 				}
+	// 				fmt.Printf("Title: %s\n", note["title"])
+	// 				fmt.Printf("%s", note["content"])
+	// 				return
+	// 			}
+	// 			return
+	// 		}
+	// 	}
+	// 	title := strings.Join(os.Args[2:], " ")
+	// 	fpath := TempFileName("blobs_note_", "")
+	// 	if err := ioutil.WriteFile(fpath, noteHeader, 0644); err != nil {
+	// 		panic(fmt.Sprintf("failed to create temp file: %s", err))
+	// 	}
+	// 	defer os.Remove(fpath)
+	// 	cmd := exec.Command("vim", fpath)
+	// 	// Hook vim to the current session
+	// 	cmd.Stdin = os.Stdin
+	// 	cmd.Stdout = os.Stdout
+	// 	cmd.Stderr = os.Stderr
+	// 	if err := cmd.Start(); err != nil {
+	// 		panic(fmt.Sprintf("failed to start vim: %s", err))
+	// 	}
+	// 	if err := cmd.Wait(); err != nil {
+	// 		panic(fmt.Sprintf("failed to edit: %s", err))
+	// 	}
+	// 	data, err := ioutil.ReadFile(fpath)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("failed to open temp file: %s", err))
+	// 	}
+	// 	data = commentLine.ReplaceAll(data, []byte(""))
+	// 	log.Printf("data=%s", data)
+	// 	note := &NoteItem{
+	// 		Title:   title,
+	// 		Content: string(data),
+	// 		Kind:    "note",
+	// 	}
+	// 	js, _ := json.Marshal(note)
+	// 	id, err := col.InsertRaw(js, nil)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	fmt.Print(id)
+	// 	// TODO(tsileo) actually save note
 	default:
 		Usage()
 	}
