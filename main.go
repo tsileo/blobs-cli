@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/tsileo/blobstash/client/docstore"
 )
@@ -160,16 +161,22 @@ func main() {
 		abbrev := newAbbrev(ids)
 		fmt.Sprintf("abbrev:%+v", abbrev)
 		if flag.NArg() == 1 {
+			w := new(tabwriter.Writer)
+			w.Init(os.Stdout, 0, 8, 0, '\t', 0)
+			fmt.Fprintln(w, "ID\tCreated\tDescription\t")
+
 			for _, todo := range todos {
+				_id, _ := docstore.IDFromHex(todo["_id"].(string))
 				shortID, _ := abbrev.ShortID(todo["_id"].(string))
-				fmt.Printf("%v\t%v\t%v\n", shortID, todo["title"], todo)
+				fmt.Fprintf(w, "%v\t%v\t%v\t\n", shortID, _id.Time().Format("2006-01-02"), todo["title"])
 			}
+			fmt.Fprintln(w)
+			w.Flush()
 			return
 		}
 		if flag.Arg(1) == "done" {
 			todoArg := flag.Arg(2)
 			if todoID, ok := abbrev.ID(todoArg); ok {
-				fmt.Printf("will set to ture: %v", todoID)
 				if err := col.UpdateID(todoID, map[string]interface{}{
 					"$set": map[string]interface{}{
 						"done": true,
@@ -177,13 +184,12 @@ func main() {
 				}); err != nil {
 					panic(err)
 				}
-				fmt.Printf("Task done")
+				fmt.Printf("Completed task %v", todoID)
 				return
 			}
 		}
 		// Rebuid the todo item from args
 		text := strings.Join(os.Args[2:], " ")
-		fmt.Printf("new todo: %v", text)
 		// FIXME(ts) make docstore-cli accept struct and convert them to JSOM
 		todo := &TodoItem{
 			Title: text,
@@ -191,9 +197,11 @@ func main() {
 			Kind:  "todo",
 		}
 		js, _ := json.Marshal(todo)
-		if err := col.Insert(js, nil); err != nil {
+		_id, err := col.Insert(js, nil)
+		if err != nil {
 			panic(err)
 		}
+		fmt.Printf("Created task %v", _id.String())
 	// case "note":
 	// 	if flag.NArg() >= 1 {
 	// 		notes, err := col.Iter(map[string]interface{}{
