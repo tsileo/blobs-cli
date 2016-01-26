@@ -108,7 +108,10 @@ func newAbbrev(data []string) *Abbrev {
 func main() {
 	// commentLine, _ := regexp.Compile("(?m)^#.+\n")
 	// TODO(tsileo) config file with server address and collection name
-	col := docstore.New(docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))).Col("blobs-cli-alpha")
+	// TODO(tsileo) collection name/namespace relation and an ENV var
+	opts := docstore.DefaultOpts().SetNamespace("todos").SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
+	opts.SnappyCompression = false // FIXME(tsileo): enable it
+	col := docstore.New(opts).Col("blobs-cli-alpha2")
 	flag.Usage = Usage
 	flag.Parse()
 
