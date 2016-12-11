@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	_ "encoding/json"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -61,16 +61,34 @@ type BlobResponse struct {
 }
 
 // XXX(tsileo): tabwriter?
-func fmtBlob(blob *Blob) {
-	updated := blob.CreatedAt
-	if blob.UpdatedAt != 0 {
-		updated = blob.UpdatedAt
+func fmtBlobs(blobs []*Blob, shortHashLen int) {
+	buf := bytes.Buffer{}
+	index := map[string]string{}
+	for _, blob := range blobs {
+		updated := blob.CreatedAt
+		if blob.UpdatedAt != 0 {
+			updated = blob.UpdatedAt
+		}
+		t := "[N]"
+		if blob.Type == "file" {
+			t = "[F]"
+		}
+		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
+		if _, ok := index[shortHash]; ok {
+			fmtBlobs(blobs, shortHashLen+1)
+			return
+		}
+		index[shortHash] = blob.ID
+		buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", time.Unix(updated, 0).Format("2006-01-02T15:04:05"), shortHash, t, blob.Title))
 	}
-	t := "[N]"
-	if blob.Type == "file" {
-		t = "[F]"
+	data, err := json.Marshal(index)
+	if err != nil {
+		panic(err)
 	}
-	fmt.Printf("%s  %s  %s  %s\n", time.Unix(updated, 0).Format("2006-01-02T15:04:05"), blob.ID, t, blob.Title)
+	if err := ioutil.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")), data, 0644); err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s", buf.String())
 }
 
 func toEditor(id string, data []byte) ([]byte, error) {
@@ -137,7 +155,23 @@ func main() {
 		Usage()
 		os.Exit(2)
 	}
-
+	index := map[string]string{}
+	orig, err := ioutil.ReadFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")))
+	if err != nil && !os.IsNotExist(err) {
+		panic(err)
+	} else {
+		if orig != nil && len(orig) > 0 {
+			if err := json.Unmarshal(orig, &index); err != nil {
+				panic(err)
+			}
+		}
+	}
+	expand := func(id string) string {
+		if expanded, ok := index[id]; ok {
+			return expanded
+		}
+		return id
+	}
 	switch flag.Arg(0) {
 	case "recent", "r":
 		iter, err := col.Iter(nil, nil)
@@ -149,9 +183,7 @@ func main() {
 		if err := iter.Err(); err != nil {
 			panic(err)
 		}
-		for _, blob := range resp.Blobs {
-			fmtBlob(blob)
-		}
+		fmtBlobs(resp.Blobs, 3)
 	case "search", "s":
 		if flag.Arg(1) == "" {
 			fmt.Printf("no query")
@@ -172,13 +204,11 @@ func main() {
 		if err := iter.Err(); err != nil {
 			panic(err)
 		}
-		for _, blob := range resp.Blobs {
-			fmtBlob(blob)
-		}
+		fmtBlobs(resp.Blobs, 3)
 
 	case "edit", "e":
 		blob := &Blob2{}
-		if err := col.GetID(flag.Arg(1), &blob); err != nil {
+		if err := col.GetID(expand(flag.Arg(1)), &blob); err != nil {
 			panic(err)
 		}
 		if blob.Type != "note" {
@@ -221,7 +251,7 @@ func main() {
 		}
 	case "download", "dl":
 		blob := &Blob2{}
-		if err := col.GetID(flag.Arg(1), &blob); err != nil {
+		if err := col.GetID(expand(flag.Arg(1)), &blob); err != nil {
 			panic(err)
 		}
 		if blob.Type != "file" {
