@@ -26,31 +26,34 @@ type FileRef struct {
 	Hash string `json:"hash"`
 }
 type Blob struct {
-	CreatedAt int64  `json:"_created,omitempty" yaml:"-"`
-	Hash      string `json:"_hash,omitempty" yaml:"-"`
-	ID        string `json:"_id,omitempty" yaml:"_id"`
-	Type      string `json:"_type" yaml:"-"`
-	UpdatedAt int64  `json:"_updated,omitempty" yaml:"-"`
-	Archived  bool   `json:"archived" yaml:"archived"`
-	Content   string `json:"content" yaml:"-"`
-	Title     string `json:"title" yaml:"title"`
+	CreatedAt int64                  `json:"_created,omitempty" yaml:"-"`
+	Hash      string                 `json:"_hash,omitempty" yaml:"-"`
+	ID        string                 `json:"_id,omitempty" yaml:"_id"`
+	Type      string                 `json:"_type" yaml:"-"`
+	UpdatedAt int64                  `json:"_updated,omitempty" yaml:"-"`
+	Archived  bool                   `json:"archived" yaml:"archived"`
+	Content   string                 `json:"content" yaml:"-"`
+	Title     string                 `json:"title" yaml:"title"`
+	Meta      map[string]interface{} `json:"meta,omitempty" yaml:"meta,omitempty"`
 }
 
 type Blob2 struct {
-	CreatedAt int64  `json:"_created,omitempty" yaml:"-"`
-	Hash      string `json:"_hash,omitempty" yaml:"-"`
-	ID        string `json:"_id,omitempty" yaml:"_id"`
-	Type      string `json:"_type" yaml:"-"`
-	UpdatedAt int64  `json:"_updated,omitempty" yaml:"-"`
-	Archived  bool   `json:"archived" yaml:"archived"`
-	Content   string `json:"content" yaml:"-"`
-	Title     string `json:"title" yaml:"title"`
-	Ref       string `json:"_ref,omitempty" yaml:"-"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
+	CreatedAt int64                  `json:"_created,omitempty" yaml:"-"`
+	Hash      string                 `json:"_hash,omitempty" yaml:"-"`
+	ID        string                 `json:"_id,omitempty" yaml:"_id"`
+	Type      string                 `json:"_type" yaml:"-"`
+	UpdatedAt int64                  `json:"_updated,omitempty" yaml:"-"`
+	Archived  bool                   `json:"archived" yaml:"archived"`
+	Content   string                 `json:"content" yaml:"-"`
+	Title     string                 `json:"title" yaml:"title"`
+	Ref       string                 `json:"_ref,omitempty" yaml:"-"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
+	Meta      map[string]interface{} `json:"meta,omitempty" yaml:"meta,omitempty"`
 }
 
 type BlobYAMLHeader struct {
-	Archived bool   `yaml:"archived"`
-	Title    string `yaml:"title"`
+	Archived bool                   `yaml:"archived"`
+	Title    string                 `yaml:"title"`
+	Meta     map[string]interface{} `yaml:"meta,omitempty"`
 }
 
 type BlobResponse struct {
@@ -111,6 +114,7 @@ func dataToBlob(data []byte) (*Blob, error) {
 		Type:     "note",
 		Archived: header.Archived,
 		Title:    header.Title,
+		Meta:     header.Meta,
 		Content:  string(parts[2]),
 	}, nil
 
