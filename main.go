@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	_ "encoding/json"
 	"flag"
 	"fmt"
@@ -17,13 +15,6 @@ import (
 	"github.com/tsileo/blobstash/pkg/client/docstore"
 	"gopkg.in/yaml.v2"
 )
-
-// TempFileName generates a temporary filename
-func TempFileName(prefix, suffix string) string {
-	randBytes := make([]byte, 16)
-	rand.Read(randBytes)
-	return filepath.Join(os.TempDir(), prefix+hex.EncodeToString(randBytes)+suffix)
-}
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -132,8 +123,7 @@ type SearchQuery struct {
 
 func main() {
 	// TODO(tsileo) config file with server address and collection name
-	opts := docstore.DefaultOpts().SetNamespace("todos").SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
-	opts.SnappyCompression = false // FIXME(tsileo): enable it
+	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
 	ds := docstore.New(opts)
 	col := ds.Col("notes21")
 	flag.Usage = Usage
@@ -238,6 +228,18 @@ func main() {
 			panic(err)
 		}
 	case "upload":
+		ref, err := ds.UploadAttachment(flag.Arg(1))
+		if err != nil {
+			panic(err)
+		}
+		blob := &Blob2{
+			Title: filepath.Base(flag.Arg(1)),
+			Type:  "file",
+			Ref:   "#blobstash/json:" + ref,
+		}
+		if _, err := col.Insert(blob, nil); err != nil {
+			panic(err)
+		}
 	case "convert":
 	default:
 		Usage()
