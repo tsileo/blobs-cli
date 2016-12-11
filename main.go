@@ -1,20 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	_ "encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
+	"time"
 
-	"github.com/tsileo/blobstash/client/docstore"
+	"github.com/tsileo/blobstash/pkg/client/docstore"
+	"gopkg.in/yaml.v2"
 )
-
-var noteHeader = []byte("\n# Please write your note. Lines starting with # will be ignored.")
 
 // TempFileName generates a temporary filename
 func TempFileName(prefix, suffix string) string {
@@ -29,89 +31,111 @@ var Usage = func() {
 	flag.PrintDefaults()
 }
 
-type NoteItem struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Kind    string `json:"_kind"`
+type FileRef struct {
+	Hash string `json:"hash"`
+}
+type Blob struct {
+	CreatedAt int64  `json:"_created,omitempty" yaml:"-"`
+	Hash      string `json:"_hash,omitempty" yaml:"-"`
+	ID        string `json:"_id,omitempty" yaml:"_id"`
+	Type      string `json:"_type" yaml:"-"`
+	UpdatedAt int64  `json:"_updated,omitempty" yaml:"-"`
+	Archived  bool   `json:"archived" yaml:"archived"`
+	Content   string `json:"content" yaml:"-"`
+	Title     string `json:"title" yaml:"title"`
 }
 
-type TodoItem struct {
-	Title string `json:"title"`
-	Done  bool   `json:"done"`
-	Kind  string `json:"_kind"`
+type Blob2 struct {
+	CreatedAt int64  `json:"_created,omitempty" yaml:"-"`
+	Hash      string `json:"_hash,omitempty" yaml:"-"`
+	ID        string `json:"_id,omitempty" yaml:"_id"`
+	Type      string `json:"_type" yaml:"-"`
+	UpdatedAt int64  `json:"_updated,omitempty" yaml:"-"`
+	Archived  bool   `json:"archived" yaml:"archived"`
+	Content   string `json:"content" yaml:"-"`
+	Title     string `json:"title" yaml:"title"`
+	Ref       string `json:"_ref,omitempty"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
 }
 
-// Reverse returns its argument string reversed rune-wise left to right.
-func Reverse(s string) string {
-	r := []rune(s)
-	for i, j := 0, len(r)-1; i < len(r)/2; i, j = i+1, j-1 {
-		r[i], r[j] = r[j], r[i]
+type BlobYAMLHeader struct {
+	Archived bool   `yaml:"archived"`
+	Title    string `yaml:"title"`
+}
+
+type BlobResponse struct {
+	Blobs []*Blob `json:"data"`
+}
+
+// XXX(tsileo): tabwriter?
+func fmtBlob(blob *Blob) {
+	updated := blob.CreatedAt
+	if blob.UpdatedAt != 0 {
+		updated = blob.UpdatedAt
 	}
-	return string(r)
-}
-
-type Abbrev struct {
-	refs  map[string]string
-	irefs map[string]string
-}
-
-func (a *Abbrev) ShortID(id string) (string, bool) {
-	short, ok := a.irefs[Reverse(id)]
-	return short, ok
-}
-
-func (a *Abbrev) ID(short string) (string, bool) {
-	id, ok := a.refs[short]
-	return Reverse(id), ok
-}
-
-func countprefix(data []string, prefix string) (cnt int) {
-	for _, word := range data {
-		if strings.HasPrefix(word, prefix) {
-			cnt++
-		}
+	t := "[N]"
+	if blob.Type == "file" {
+		t = "[F]"
 	}
-	return
+	fmt.Printf("%s  %s  %s  %s\n", time.Unix(updated, 0).Format("2006-01-02T15:04:05"), blob.ID, t, blob.Title)
 }
 
-// FIXME(tsileo) bugfix abbreviation when len(data) == 1
-
-func newAbbrev(data []string) *Abbrev {
-	if len(data) == 1 {
-		return &Abbrev{
-			irefs: map[string]string{
-				data[0]: string(data[0][len(data[0])-1]),
-			},
-			refs: map[string]string{
-				string(data[0][len(data[0])-1]): data[0],
-			},
-		}
+func toEditor(id string, data []byte) ([]byte, error) {
+	// FIXME(tsileo): check if it already exist, and handle the restoration like swp vim
+	fpath := filepath.Join(os.TempDir(), fmt.Sprintf("blob_%s", id))
+	if err := ioutil.WriteFile(fpath, data, 0644); err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %s", err)
 	}
-	// TODO(tsileo) reverse data here in a new slice
-	irefs := map[string]string{}
-	refs := map[string]string{}
-	for _, word := range data {
-		for i, _ := range word {
-			prefix := word[:i]
-			if prefix == word || countprefix(data, prefix) == 1 {
-				refs[prefix] = word
-				if _, ok := irefs[word]; !ok {
-					irefs[word] = prefix
-				}
-			}
-
-		}
+	defer os.Remove(fpath)
+	// Spawn $EDITOR and wait for its exit
+	// FIXME(tsileo): use $EDITOR
+	cmd := exec.Command("vim", fpath)
+	// Hook vim to the current session
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start vim: %s", err)
 	}
-	return &Abbrev{refs, irefs}
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("failed to edit: %s", err)
+	}
+	// Read the file back
+	data2, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open temp file: %s", err)
+	}
+	return data2, nil
+}
+
+func dataToBlob(data []byte) (*Blob, error) {
+	parts := bytes.Split(data, []byte("---\n"))
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("bad input")
+	}
+	header := &BlobYAMLHeader{}
+	if err := yaml.Unmarshal(parts[1], &header); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML: %v", err)
+	}
+	return &Blob{
+		Type:     "note",
+		Archived: header.Archived,
+		Title:    header.Title,
+		Content:  string(parts[2]),
+	}, nil
+
+}
+
+type SearchQuery struct {
+	Fields      []string `json:"fields"`
+	QueryString string   `json:"qs"`
 }
 
 func main() {
-	// commentLine, _ := regexp.Compile("(?m)^#.+\n")
 	// TODO(tsileo) config file with server address and collection name
-	// TODO(tsileo) collection name/namespace relation and an ENV var
 	opts := docstore.DefaultOpts().SetNamespace("todos").SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
 	opts.SnappyCompression = false // FIXME(tsileo): enable it
-	col := docstore.New(opts).Col("blobs-cli-alpha2")
+	ds := docstore.New(opts)
+	col := ds.Col("notes21")
 	flag.Usage = Usage
 	flag.Parse()
 
@@ -121,160 +145,100 @@ func main() {
 	}
 
 	switch flag.Arg(0) {
-	// case "ls":
-	// 	items, err := col.Iter(nil)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	ids := []string{}
-	// 	// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-	// 	for _, item := range items {
-	// 		ids = append(ids, Reverse(item["_id"].(string)))
-	// 	}
-	// 	abbrev := newAbbrev(ids)
-	// 	for _, item := range items {
-	// 		shortID, _ := abbrev.ShortID(item["_id"].(string))
-	// 		fmt.Printf("%v\t%v\t%v\n", shortID, item["_kind"].(string), item["title"])
-	// 	}
-
-	case "todo":
-		// todos := []*TodoItem{}
-		todos := []map[string]interface{}{}
-		q := map[string]interface{}{
-			"done":  false,
-			"_kind": "todo",
-		}
-		citer, err := col.Iter(q, nil)
+	case "recent", "r":
+		iter, err := col.Iter(nil, nil)
 		if err != nil {
 			panic(err)
 		}
-		tmp := []map[string]interface{}{}
-		for citer.Next(&tmp) {
-			todos = append(todos, tmp...)
-		}
-		if err := citer.Err(); err != nil {
+		resp := &BlobResponse{}
+		iter.Next(resp)
+		if err := iter.Err(); err != nil {
 			panic(err)
 		}
-		// FIXME(tsileo): test the itearator API and see if it looks natural
-		ids := []string{}
-		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-		for _, todo := range todos {
-			ids = append(ids, Reverse(todo["_id"].(string)))
+		for _, blob := range resp.Blobs {
+			fmtBlob(blob)
 		}
-		abbrev := newAbbrev(ids)
-		fmt.Sprintf("abbrev:%+v", abbrev)
-		if flag.NArg() == 1 {
-			w := new(tabwriter.Writer)
-			w.Init(os.Stdout, 0, 8, 0, '\t', 0)
-			fmt.Fprintln(w, "ID\tCreated\tDescription\t")
-
-			for _, todo := range todos {
-				_id, _ := docstore.IDFromHex(todo["_id"].(string))
-				shortID, _ := abbrev.ShortID(todo["_id"].(string))
-				fmt.Fprintf(w, "%v\t%v\t%v\t\n", shortID, _id.Time().Format("2006-01-02"), todo["title"])
-			}
-			fmt.Fprintln(w)
-			w.Flush()
+	case "search", "s":
+		if flag.Arg(1) == "" {
+			fmt.Printf("no query")
 			return
 		}
-		if flag.Arg(1) == "done" {
-			todoArg := flag.Arg(2)
-			if todoID, ok := abbrev.ID(todoArg); ok {
-				if err := col.UpdateID(todoID, map[string]interface{}{
-					"$set": map[string]interface{}{
-						"done": true,
-					},
-				}); err != nil {
-					panic(err)
-				}
-				fmt.Printf("Completed task %v", todoID)
-				return
-			}
-		}
-		// Rebuid the todo item from args
-		text := strings.Join(os.Args[2:], " ")
-		// FIXME(ts) make docstore-cli accept struct and convert them to JSOM
-		todo := &TodoItem{
-			Title: text,
-			Done:  false,
-			Kind:  "todo",
-		}
-		js, _ := json.Marshal(todo)
-		_id, err := col.Insert(js, nil)
+		iter, err := col.Iter(&docstore.Query{
+			StoredQuery: "blobs-search",
+			StoredQueryArgs: &SearchQuery{
+				Fields:      []string{"title", "content"},
+				QueryString: flag.Arg(1),
+			},
+		}, nil)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("Created task %v", _id.String())
-	// case "note":
-	// 	if flag.NArg() >= 1 {
-	// 		notes, err := col.Iter(map[string]interface{}{
-	// 			"_kind": "note",
-	// 		})
-	// 		if err != nil {
-	// 			panic(err)
-	// 		}
-	// 		ids := []string{}
-	// 		// FIXME(tsileo) add Abbrev here, do a first pass before displaying
-	// 		for _, note := range notes {
-	// 			ids = append(ids, Reverse(note["_id"].(string)))
-	// 		}
-	// 		abbrev := newAbbrev(ids)
-	// 		if flag.NArg() == 1 {
-	// 			for _, note := range notes {
-	// 				shortID, _ := abbrev.ShortID(note["_id"].(string))
-	// 				fmt.Printf("%v\t%v\n", shortID, note["title"])
-	// 			}
-	// 			return
-	// 		}
-	// 		if flag.Arg(1) == "view" {
-	// 			noteArg := flag.Arg(2)
-	// 			if noteID, ok := abbrev.ID(noteArg); ok {
-	// 				note := map[string]interface{}{}
-	// 				if err := col.Get(noteID, &note); err != nil {
-	// 					panic(err)
-	// 				}
-	// 				fmt.Printf("Title: %s\n", note["title"])
-	// 				fmt.Printf("%s", note["content"])
-	// 				return
-	// 			}
-	// 			return
-	// 		}
-	// 	}
-	// 	title := strings.Join(os.Args[2:], " ")
-	// 	fpath := TempFileName("blobs_note_", "")
-	// 	if err := ioutil.WriteFile(fpath, noteHeader, 0644); err != nil {
-	// 		panic(fmt.Sprintf("failed to create temp file: %s", err))
-	// 	}
-	// 	defer os.Remove(fpath)
-	// 	cmd := exec.Command("vim", fpath)
-	// 	// Hook vim to the current session
-	// 	cmd.Stdin = os.Stdin
-	// 	cmd.Stdout = os.Stdout
-	// 	cmd.Stderr = os.Stderr
-	// 	if err := cmd.Start(); err != nil {
-	// 		panic(fmt.Sprintf("failed to start vim: %s", err))
-	// 	}
-	// 	if err := cmd.Wait(); err != nil {
-	// 		panic(fmt.Sprintf("failed to edit: %s", err))
-	// 	}
-	// 	data, err := ioutil.ReadFile(fpath)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("failed to open temp file: %s", err))
-	// 	}
-	// 	data = commentLine.ReplaceAll(data, []byte(""))
-	// 	log.Printf("data=%s", data)
-	// 	note := &NoteItem{
-	// 		Title:   title,
-	// 		Content: string(data),
-	// 		Kind:    "note",
-	// 	}
-	// 	js, _ := json.Marshal(note)
-	// 	id, err := col.InsertRaw(js, nil)
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	fmt.Print(id)
-	// 	// TODO(tsileo) actually save note
+		resp := &BlobResponse{}
+		iter.Next(resp)
+		if err := iter.Err(); err != nil {
+			panic(err)
+		}
+		for _, blob := range resp.Blobs {
+			fmtBlob(blob)
+		}
+
+	case "edit", "e":
+		blob := &Blob2{}
+		if err := col.GetID(flag.Arg(1), &blob); err != nil {
+			panic(err)
+		}
+		if blob.Type != "note" {
+			panic("not a note")
+		}
+		out := []byte("---\n")
+		d, err := yaml.Marshal(blob)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, d...)
+		out = append(out, []byte("---\n")...)
+		out = append(out, []byte(blob.Content)...)
+		data, err := toEditor(blob.ID, out)
+		if err != nil {
+			panic(err)
+		}
+		updatedBlob, err := dataToBlob(data)
+		if err != nil {
+			panic(err)
+		}
+		if updatedBlob.Title != blob.Title || updatedBlob.Content != blob.Content {
+			if err := col.UpdateID(blob.ID, updatedBlob); err != nil {
+				panic(err)
+			}
+		}
+		// fmt.Printf("blob=%+v", updatedBlob)
+	case "new", "n":
+		out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
+		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out)
+		if err != nil {
+			panic(err)
+		}
+		updatedBlob, err := dataToBlob(data)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := col.Insert(updatedBlob, nil); err != nil {
+			panic(err)
+		}
+	case "download", "dl":
+		blob := &Blob2{}
+		if err := col.GetID(flag.Arg(1), &blob); err != nil {
+			panic(err)
+		}
+		if blob.Type != "file" {
+			panic("not a file")
+		}
+		parts := strings.Split(blob.Ref, ":")
+		if err := ds.DownloadAttachment(parts[1], blob.Title); err != nil {
+			panic(err)
+		}
+	case "upload":
+	case "convert":
 	default:
 		Usage()
 	}
