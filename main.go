@@ -45,7 +45,7 @@ type Blob2 struct {
 	Archived  bool   `json:"archived" yaml:"archived"`
 	Content   string `json:"content" yaml:"-"`
 	Title     string `json:"title" yaml:"title"`
-	Ref       string `json:"_ref,omitempty"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
+	Ref       string `json:"_ref,omitempty" yaml:"-"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
 }
 
 type BlobYAMLHeader struct {
@@ -227,7 +227,7 @@ func main() {
 		if err := ds.DownloadAttachment(parts[1], blob.Title); err != nil {
 			panic(err)
 		}
-	case "upload":
+	case "upload", "u":
 		ref, err := ds.UploadAttachment(flag.Arg(1))
 		if err != nil {
 			panic(err)
@@ -241,6 +241,23 @@ func main() {
 			panic(err)
 		}
 	case "convert":
+		orig, err := ioutil.ReadFile(flag.Arg(1))
+		if err != nil {
+			panic(err)
+		}
+		out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
+		out = append(out, orig...)
+		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out)
+		if err != nil {
+			panic(err)
+		}
+		updatedBlob, err := dataToBlob(data)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := col.Insert(updatedBlob, nil); err != nil {
+			panic(err)
+		}
 	default:
 		Usage()
 	}
