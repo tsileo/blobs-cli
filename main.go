@@ -131,12 +131,14 @@ func (eb *editedBlob) remove() error {
 	return os.Remove(eb.path)
 }
 
-func toEditor(id string, data []byte) (*editedBlob, error) {
+func toEditor(id string, data []byte, existCheck bool) (*editedBlob, error) {
 	fpath := filepath.Join(cache, fmt.Sprintf("blob_%s", id))
 
-	// Ensure we won't overwrite a file that need to be recovered
-	if _, err := os.Stat(fpath); !os.IsNotExist(err) {
-		return nil, errCacheFileExist
+	if existCheck {
+		// Ensure we won't overwrite a file that need to be recovered
+		if _, err := os.Stat(fpath); !os.IsNotExist(err) {
+			return nil, errCacheFileExist
+		}
 	}
 
 	if err := ioutil.WriteFile(fpath, data, 0640); err != nil {
@@ -233,6 +235,25 @@ func main() {
 		return id
 	}
 
+	saveBlob := func(blob *Blob, prevBlob *Blob2) (string, error) {
+		// Blob update handling
+		if blob.ID != "" {
+			// Ensure the blob has been modified
+			if prevBlob == nil || blob.Title != prevBlob.Title || blob.Content != prevBlob.Content {
+				return "", col.UpdateID(blob.ID, blob)
+			}
+		}
+
+		// New blob handling
+		_id, err := col.Insert(blob, nil)
+		if err != nil {
+			return "", err
+		}
+
+		// No ID, it must be a new Blob
+		return _id.String(), nil
+	}
+
 	switch flag.Arg(0) {
 	case "recent", "r":
 		iter, err := col.Iter(nil, nil)
@@ -285,7 +306,7 @@ func main() {
 		out = append(out, d...)
 		out = append(out, []byte("---\n")...)
 		out = append(out, []byte(blob.Content)...)
-		data, err := toEditor(blob.ID, out)
+		data, err := toEditor(blob.ID, out, true)
 		if err != nil {
 			panic(err)
 		}
@@ -294,11 +315,8 @@ func main() {
 			panic(err)
 		}
 
-		// Ensure the blob has been modified
-		if updatedBlob.Title != blob.Title || updatedBlob.Content != blob.Content {
-			if err := col.UpdateID(blob.ID, updatedBlob); err != nil {
-				panic(err)
-			}
+		if _, err := saveBlob(updatedBlob, blob); err != nil {
+			panic(err)
 		}
 
 		// Now we can safely delete the temp file
@@ -309,7 +327,7 @@ func main() {
 
 	case "new", "n":
 		out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
-		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out)
+		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
 		if err != nil {
 			panic(err)
 		}
@@ -321,17 +339,22 @@ func main() {
 		// TODO(tsileo): a warning on empty notes?
 		// if updatedBlob.Content == "" {}
 
-		_id, err := col.Insert(updatedBlob, nil)
+		_id, err := saveBlob(updatedBlob, nil)
 		if err != nil {
 			panic(err)
 		}
+
+		// _id, err := col.Insert(updatedBlob, nil)
+		// if err != nil {
+		// 	panic(err)
+		// }
 
 		// Now we can safely delete the temp file
 		if err := data.remove(); err != nil {
 			panic(err)
 		}
 
-		fmt.Printf("Blob %s created", _id.String())
+		fmt.Printf("Blob %s created", _id)
 
 	case "download", "dl":
 		blob := &Blob2{}
@@ -374,7 +397,7 @@ func main() {
 		title := filepath.Base(flag.Arg(1))
 		out := []byte(fmt.Sprintf("---\narchived: false\ntitle: '%s'\n---\n", title))
 		out = append(out, orig...)
-		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out)
+		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
 		if err != nil {
 			panic(err)
 		}
@@ -384,7 +407,7 @@ func main() {
 			panic(err)
 		}
 
-		_id, err := col.Insert(updatedBlob, nil)
+		_id, err := saveBlob(updatedBlob, nil)
 		if err != nil {
 			panic(err)
 		}
@@ -394,9 +417,49 @@ func main() {
 			panic(err)
 		}
 
-		fmt.Printf("Blob %s created", _id.String())
+		fmt.Printf("Blob %s created", _id)
 
-	case "restore":
+	case "recover":
+		// Recover a single Blob
+		if flag.NArg() == 2 {
+			data, err := ioutil.ReadFile(filepath.Join(cache, fmt.Sprintf("blob_%s", flag.Arg(1))))
+			switch {
+			case os.IsNotExist(err):
+				fmt.Printf("No such blob to recover")
+				return
+			case err == nil:
+			default:
+				panic(err)
+			}
+
+			data2, err := toEditor(flag.Arg(1), data, false)
+			if err != nil {
+				panic(err)
+			}
+			updatedBlob, err := dataToBlob(data2.data)
+			if err != nil {
+				panic(err)
+			}
+
+			if _, err := saveBlob(updatedBlob, nil); err != nil {
+				panic(err)
+			}
+
+			// Now we can safely delete the temp file
+			if err := data2.remove(); err != nil {
+				panic(err)
+			}
+
+			_id, err := saveBlob(updatedBlob, nil)
+			if err != nil {
+				panic(err)
+			}
+
+			fmt.Printf("Blob %s recovered and saved", _id)
+			return
+		}
+
+		// List all blobs available for recovery
 		d, err := os.Open(cache)
 		if err != nil {
 			printErr("failed to open cache dir", err)
@@ -405,13 +468,30 @@ func main() {
 		if err != nil {
 			printErr("failed to read cache dir", err)
 		}
+		buf := &bytes.Buffer{}
 		for _, fi := range fis {
 			if strings.HasPrefix(fi.Name(), "blob_") {
-
-				// buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", time.Unix(updated, 0).Format("2006-01-02  15:04"), shortHash, t, blob.Title))
-
+				data, err := ioutil.ReadFile(filepath.Join(cache, fi.Name()))
+				if err != nil {
+					printErr("failed to read restore file", err)
+				}
+				blob, err := dataToBlob(data)
+				if err != nil {
+					printErr("file looks corrupted", err)
+				}
+				blobID := blob.ID
+				// If there's no ID yet, use the timsetamp as ID instead
+				flag := "[N] "
+				if blobID == "" {
+					n := fi.Name()
+					blobID = fi.Name()[5:len(n)]
+					flag = "[UN]"
+				}
+				// TODO(tsileo): tabwriter
+				buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", fi.ModTime().Format("2006-01-02  15:04"), blobID, flag, blob.Title))
 			}
 		}
+		fmt.Printf(buf.String())
 		if err := d.Close(); err != nil {
 			printErr("failed to close cache dir", err)
 		}
