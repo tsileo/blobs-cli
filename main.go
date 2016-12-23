@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"context"
+	"github.com/google/subcommands"
 	"github.com/mitchellh/go-homedir"
 	"github.com/tsileo/blobstash/pkg/client/docstore"
 	"gopkg.in/yaml.v2"
@@ -47,10 +49,172 @@ func cacheDir() (string, error) {
 	return p, nil
 }
 
-var Usage = func() {
-	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "  %s SUBCOMMAND\n", os.Args[0])
-	flag.PrintDefaults()
+type recentCmd struct {
+	col *docstore.Collection
+}
+
+func (*recentCmd) Name() string     { return "recent" }
+func (*recentCmd) Synopsis() string { return "Display recent blobs" }
+func (*recentCmd) Usage() string {
+	return `recent :
+	Display recent blobs.
+`
+}
+
+func (*recentCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (r *recentCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	iter, err := r.col.Iter(nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	resp := &BlobResponse{}
+	iter.Next(resp)
+	if err := iter.Err(); err != nil {
+		panic(err)
+	}
+	// FIXME(tsileo): an option to display full hash
+	fmtBlobs(resp.Blobs, 3)
+
+	return subcommands.ExitSuccess
+}
+
+type searchCmd struct {
+	col *docstore.Collection
+}
+
+func (*searchCmd) Name() string     { return "search" }
+func (*searchCmd) Synopsis() string { return "Search blobs" }
+func (*searchCmd) Usage() string {
+	return `search <query>:
+	Search blobs.
+`
+}
+
+func (*searchCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	if flag.Arg(1) == "" {
+		fmt.Printf("no query")
+		return subcommands.ExitSuccess
+	}
+	iter, err := s.col.Iter(&docstore.Query{
+		StoredQuery: "blobs-search",
+		StoredQueryArgs: &searchQuery{
+			Fields:      []string{"title", "content"},
+			QueryString: flag.Arg(1),
+		},
+	}, nil)
+	if err != nil {
+		panic(err)
+	}
+	resp := &BlobResponse{}
+	iter.Next(resp)
+	if err := iter.Err(); err != nil {
+		panic(err)
+	}
+	fmtBlobs(resp.Blobs, 3)
+	return subcommands.ExitSuccess
+}
+
+type editCmd struct {
+	col      *docstore.Collection
+	expand   func(string) string
+	saveBlob func(*Blob, *Blob2) (string, error)
+}
+
+func (*editCmd) Name() string     { return "edit" }
+func (*editCmd) Synopsis() string { return "Edit a blob" }
+func (*editCmd) Usage() string {
+	return `edit <id>:
+	Spawn $EDITOR to edit the blob.
+`
+}
+
+func (*editCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (e *editCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	blob := &Blob2{}
+	if err := e.col.GetID(e.expand(flag.Arg(1)), &blob); err != nil {
+		panic(err)
+	}
+	if blob.Type != "note" {
+		panic("not a note")
+	}
+	out := []byte("---\n")
+	d, err := yaml.Marshal(blob)
+	if err != nil {
+		panic(err)
+	}
+	out = append(out, d...)
+	out = append(out, []byte("---\n")...)
+	out = append(out, []byte(blob.Content)...)
+	data, err := toEditor(blob.ID, out, true)
+	if err != nil {
+		panic(err)
+	}
+	updatedBlob, err := dataToBlob(data.data)
+	if err != nil {
+		panic(err)
+	}
+
+	if _, err := e.saveBlob(updatedBlob, blob); err != nil {
+		panic(err)
+	}
+
+	// Now we can safely delete the temp file
+	if err := data.remove(); err != nil {
+		panic(err)
+	}
+	return subcommands.ExitSuccess
+}
+
+type newCmd struct {
+	col      *docstore.Collection
+	saveBlob func(*Blob, *Blob2) (string, error)
+}
+
+func (*newCmd) Name() string     { return "new" }
+func (*newCmd) Synopsis() string { return "Create a new blob" }
+func (*newCmd) Usage() string {
+	return `new :
+	Create a new blob.
+`
+}
+
+func (*newCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
+	data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
+	if err != nil {
+		panic(err)
+	}
+	updatedBlob, err := dataToBlob(data.data)
+	if err != nil {
+		panic(err)
+	}
+
+	// TODO(tsileo): a warning on empty notes?
+	// if updatedBlob.Content == "" {}
+
+	_id, err := n.saveBlob(updatedBlob, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// _id, err := col.Insert(updatedBlob, nil)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// Now we can safely delete the temp file
+	if err := data.remove(); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Blob %s created", _id)
+	return subcommands.ExitSuccess
 }
 
 type FileRef struct {
@@ -200,13 +364,6 @@ func main() {
 	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
 	ds := docstore.New(opts)
 	col := ds.Col("notes21")
-	flag.Usage = Usage
-	flag.Parse()
-
-	if flag.NArg() < 1 {
-		Usage()
-		os.Exit(2)
-	}
 
 	var err error
 	// Init cache
@@ -254,108 +411,29 @@ func main() {
 		return _id.String(), nil
 	}
 
+	subcommands.Register(subcommands.HelpCommand(), "")
+	subcommands.Register(subcommands.FlagsCommand(), "")
+	subcommands.Register(subcommands.CommandsCommand(), "")
+	// subcommands.Register(&printCmd{}, "")
+	subcommands.Register(&recentCmd{col}, "")
+	subcommands.Register(&searchCmd{col}, "")
+	subcommands.Register(&editCmd{
+		col:      col,
+		saveBlob: saveBlob,
+		expand:   expand,
+	}, "")
+	subcommands.Register(&newCmd{
+		col:      col,
+		saveBlob: saveBlob,
+	}, "")
+
+	flag.Parse()
+	ctx := context.Background()
+	os.Exit(int(subcommands.Execute(ctx)))
+
 	switch flag.Arg(0) {
-	case "recent", "r":
-		iter, err := col.Iter(nil, nil)
-		if err != nil {
-			panic(err)
-		}
-		resp := &BlobResponse{}
-		iter.Next(resp)
-		if err := iter.Err(); err != nil {
-			panic(err)
-		}
-		// FIXME(tsileo): an option to display full hash
-		fmtBlobs(resp.Blobs, 3)
-
-	case "search", "s":
-		if flag.Arg(1) == "" {
-			fmt.Printf("no query")
-			return
-		}
-		iter, err := col.Iter(&docstore.Query{
-			StoredQuery: "blobs-search",
-			StoredQueryArgs: &searchQuery{
-				Fields:      []string{"title", "content"},
-				QueryString: flag.Arg(1),
-			},
-		}, nil)
-		if err != nil {
-			panic(err)
-		}
-		resp := &BlobResponse{}
-		iter.Next(resp)
-		if err := iter.Err(); err != nil {
-			panic(err)
-		}
-		fmtBlobs(resp.Blobs, 3)
-
 	case "edit", "e":
-		blob := &Blob2{}
-		if err := col.GetID(expand(flag.Arg(1)), &blob); err != nil {
-			panic(err)
-		}
-		if blob.Type != "note" {
-			panic("not a note")
-		}
-		out := []byte("---\n")
-		d, err := yaml.Marshal(blob)
-		if err != nil {
-			panic(err)
-		}
-		out = append(out, d...)
-		out = append(out, []byte("---\n")...)
-		out = append(out, []byte(blob.Content)...)
-		data, err := toEditor(blob.ID, out, true)
-		if err != nil {
-			panic(err)
-		}
-		updatedBlob, err := dataToBlob(data.data)
-		if err != nil {
-			panic(err)
-		}
-
-		if _, err := saveBlob(updatedBlob, blob); err != nil {
-			panic(err)
-		}
-
-		// Now we can safely delete the temp file
-		if err := data.remove(); err != nil {
-			panic(err)
-		}
-		// fmt.Printf("blob=%+v", updatedBlob)
-
 	case "new", "n":
-		out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
-		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
-		if err != nil {
-			panic(err)
-		}
-		updatedBlob, err := dataToBlob(data.data)
-		if err != nil {
-			panic(err)
-		}
-
-		// TODO(tsileo): a warning on empty notes?
-		// if updatedBlob.Content == "" {}
-
-		_id, err := saveBlob(updatedBlob, nil)
-		if err != nil {
-			panic(err)
-		}
-
-		// _id, err := col.Insert(updatedBlob, nil)
-		// if err != nil {
-		// 	panic(err)
-		// }
-
-		// Now we can safely delete the temp file
-		if err := data.remove(); err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("Blob %s created", _id)
-
 	case "download", "dl":
 		blob := &Blob2{}
 		if err := col.GetID(expand(flag.Arg(1)), &blob); err != nil {
@@ -497,6 +575,5 @@ func main() {
 		}
 
 	default:
-		Usage()
 	}
 }
