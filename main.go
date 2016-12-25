@@ -215,6 +215,222 @@ func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) s
 
 	fmt.Printf("Blob %s created", _id)
 	return subcommands.ExitSuccess
+
+}
+
+type downloadCmd struct {
+	col    *docstore.Collection
+	expand func(string) string
+	ds     *docstore.DocStore
+}
+
+func (*downloadCmd) Name() string     { return "download" }
+func (*downloadCmd) Synopsis() string { return "Download files to the current working directory" }
+func (*downloadCmd) Usage() string {
+	return `download <id1 id2 ...> :
+	Download files to the current directory.
+`
+}
+
+func (*downloadCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	for _, id := range f.Args() {
+		blob := &Blob2{}
+		if err := d.col.GetID(d.expand(id), &blob); err != nil {
+			panic(err)
+		}
+		if blob.Type != "file" {
+			panic("not a file")
+		}
+		parts := strings.Split(blob.Ref, ":")
+		if err := d.ds.DownloadAttachment(parts[1], blob.Title); err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("Blob downloaded at %s", blob.Title)
+	}
+	return subcommands.ExitSuccess
+
+}
+
+type uploadCmd struct {
+	col *docstore.Collection
+	ds  *docstore.DocStore
+}
+
+func (*uploadCmd) Name() string     { return "upload" }
+func (*uploadCmd) Synopsis() string { return "Upload the given files" }
+func (*uploadCmd) Usage() string {
+	return `upload </path/to/file1 /file2 ...>:
+	Upload the given files..
+`
+}
+
+func (*uploadCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	for _, path := range f.Args() {
+		ref, err := u.ds.UploadAttachment(path)
+		if err != nil {
+			panic(err)
+		}
+		blob := &Blob2{
+			Title: filepath.Base(path),
+			Type:  "file",
+			Ref:   "#blobstash/json:" + ref,
+		}
+		_id, err := u.col.Insert(blob, nil)
+		if err != nil {
+			// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it
+			panic(err)
+		}
+		fmt.Printf("Blob %s created", _id.String())
+
+	}
+
+	return subcommands.ExitSuccess
+}
+
+type convertCmd struct {
+	saveBlob func(*Blob, *Blob2) (string, error)
+}
+
+func (*convertCmd) Name() string     { return "convert" }
+func (*convertCmd) Synopsis() string { return "Create a new blob using the file content" }
+func (*convertCmd) Usage() string {
+	return `convert <path> <path> <...>:
+  Print args to stdout.
+`
+}
+
+func (*convertCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (c *convertCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	// FIXME(tsileo): allow to convert multiple files without opening them
+	orig, err := ioutil.ReadFile(flag.Arg(1))
+	if err != nil {
+		panic(err)
+	}
+	title := filepath.Base(flag.Arg(1))
+	out := []byte(fmt.Sprintf("---\narchived: false\ntitle: '%s'\n---\n", title))
+	out = append(out, orig...)
+	data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
+	if err != nil {
+		panic(err)
+	}
+
+	updatedBlob, err := dataToBlob(data.data)
+	if err != nil {
+		panic(err)
+	}
+
+	_id, err := c.saveBlob(updatedBlob, nil)
+	if err != nil {
+		panic(err)
+	}
+
+	// Now we can safely delete the temp file
+	if err := data.remove(); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Blob %s created", _id)
+
+	return subcommands.ExitSuccess
+}
+
+type recoverCmd struct {
+	saveBlob func(*Blob, *Blob2) (string, error)
+}
+
+func (*recoverCmd) Name() string     { return "recover" }
+func (*recoverCmd) Synopsis() string { return "List or recover a Blob" }
+func (*recoverCmd) Usage() string {
+	return `recover [<id>]:
+	List or recover a Blob.
+`
+}
+
+func (*recoverCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	// Recover a single Blob
+	if flag.NArg() == 1 {
+		data, err := ioutil.ReadFile(filepath.Join(cache, fmt.Sprintf("blob_%s", flag.Arg(1))))
+		switch {
+		case os.IsNotExist(err):
+			fmt.Printf("No such blob to recover")
+			return subcommands.ExitSuccess
+		case err == nil:
+		default:
+			panic(err)
+		}
+
+		data2, err := toEditor(flag.Arg(1), data, false)
+		if err != nil {
+			panic(err)
+		}
+		updatedBlob, err := dataToBlob(data2.data)
+		if err != nil {
+			panic(err)
+		}
+
+		if _, err := r.saveBlob(updatedBlob, nil); err != nil {
+			panic(err)
+		}
+
+		// Now we can safely delete the temp file
+		if err := data2.remove(); err != nil {
+			panic(err)
+		}
+
+		_id, err := r.saveBlob(updatedBlob, nil)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("Blob %s recovered and saved", _id)
+		return subcommands.ExitSuccess
+	}
+
+	// List all blobs available for recovery
+	d, err := os.Open(cache)
+	if err != nil {
+		printErr("failed to open cache dir", err)
+	}
+	fis, err := d.Readdir(-1)
+	if err != nil {
+		printErr("failed to read cache dir", err)
+	}
+	buf := &bytes.Buffer{}
+	for _, fi := range fis {
+		if strings.HasPrefix(fi.Name(), "blob_") {
+			data, err := ioutil.ReadFile(filepath.Join(cache, fi.Name()))
+			if err != nil {
+				printErr("failed to read restore file", err)
+			}
+			blob, err := dataToBlob(data)
+			if err != nil {
+				printErr("file looks corrupted", err)
+			}
+			blobID := blob.ID
+			// If there's no ID yet, use the timsetamp as ID instead
+			flag := "[N] "
+			if blobID == "" {
+				n := fi.Name()
+				blobID = fi.Name()[5:len(n)]
+				flag = "[UN]"
+			}
+			// TODO(tsileo): tabwriter
+			buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", fi.ModTime().Format("2006-01-02  15:04"), blobID, flag, blob.Title))
+		}
+	}
+	fmt.Printf(buf.String())
+	if err := d.Close(); err != nil {
+		printErr("failed to close cache dir", err)
+	}
+	return subcommands.ExitSuccess
 }
 
 type FileRef struct {
@@ -393,14 +609,19 @@ func main() {
 	}
 
 	saveBlob := func(blob *Blob, prevBlob *Blob2) (string, error) {
+		fmt.Printf("saveBlob(%+v, %+v)\n", blob, prevBlob)
 		// Blob update handling
-		if blob.ID != "" {
+		if prevBlob != nil && prevBlob.ID != "" {
+			fmt.Printf("update")
 			// Ensure the blob has been modified
-			if prevBlob == nil || blob.Title != prevBlob.Title || blob.Content != prevBlob.Content {
-				return "", col.UpdateID(blob.ID, blob)
+			if blob.Title != prevBlob.Title || blob.Content != prevBlob.Content {
+				fmt.Printf("updated %s %+v", prevBlob.ID, blob)
+				return prevBlob.ID, col.UpdateID(prevBlob.ID, blob)
 			}
+			return prevBlob.ID, nil
 		}
 
+		fmt.Println("new")
 		// New blob handling
 		_id, err := col.Insert(blob, nil)
 		if err != nil {
@@ -414,7 +635,6 @@ func main() {
 	subcommands.Register(subcommands.HelpCommand(), "")
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	subcommands.Register(subcommands.CommandsCommand(), "")
-	// subcommands.Register(&printCmd{}, "")
 	subcommands.Register(&recentCmd{col}, "")
 	subcommands.Register(&searchCmd{col}, "")
 	subcommands.Register(&editCmd{
@@ -426,154 +646,23 @@ func main() {
 		col:      col,
 		saveBlob: saveBlob,
 	}, "")
+	subcommands.Register(&convertCmd{
+		saveBlob: saveBlob,
+	}, "")
+	subcommands.Register(&recoverCmd{
+		saveBlob: saveBlob,
+	}, "")
+	subcommands.Register(&downloadCmd{
+		col:    col,
+		ds:     ds,
+		expand: expand,
+	}, "")
+	subcommands.Register(&uploadCmd{
+		col: col,
+		ds:  ds,
+	}, "")
 
 	flag.Parse()
 	ctx := context.Background()
 	os.Exit(int(subcommands.Execute(ctx)))
-
-	switch flag.Arg(0) {
-	case "edit", "e":
-	case "new", "n":
-	case "download", "dl":
-		blob := &Blob2{}
-		if err := col.GetID(expand(flag.Arg(1)), &blob); err != nil {
-			panic(err)
-		}
-		if blob.Type != "file" {
-			panic("not a file")
-		}
-		parts := strings.Split(blob.Ref, ":")
-		if err := ds.DownloadAttachment(parts[1], blob.Title); err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("Blob downloaded at %s", blob.Title)
-
-	case "upload", "u":
-		// FIXME(tsileo): iter over all `flag.Arg(x)` and support tagging them?
-		ref, err := ds.UploadAttachment(flag.Arg(1))
-		if err != nil {
-			panic(err)
-		}
-		blob := &Blob2{
-			Title: filepath.Base(flag.Arg(1)),
-			Type:  "file",
-			Ref:   "#blobstash/json:" + ref,
-		}
-		_id, err := col.Insert(blob, nil)
-		if err != nil {
-			// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it
-			panic(err)
-		}
-		fmt.Printf("Blob %s created", _id.String())
-
-	case "convert":
-		orig, err := ioutil.ReadFile(flag.Arg(1))
-		if err != nil {
-			panic(err)
-		}
-		title := filepath.Base(flag.Arg(1))
-		out := []byte(fmt.Sprintf("---\narchived: false\ntitle: '%s'\n---\n", title))
-		out = append(out, orig...)
-		data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
-		if err != nil {
-			panic(err)
-		}
-
-		updatedBlob, err := dataToBlob(data.data)
-		if err != nil {
-			panic(err)
-		}
-
-		_id, err := saveBlob(updatedBlob, nil)
-		if err != nil {
-			panic(err)
-		}
-
-		// Now we can safely delete the temp file
-		if err := data.remove(); err != nil {
-			panic(err)
-		}
-
-		fmt.Printf("Blob %s created", _id)
-
-	case "recover":
-		// Recover a single Blob
-		if flag.NArg() == 2 {
-			data, err := ioutil.ReadFile(filepath.Join(cache, fmt.Sprintf("blob_%s", flag.Arg(1))))
-			switch {
-			case os.IsNotExist(err):
-				fmt.Printf("No such blob to recover")
-				return
-			case err == nil:
-			default:
-				panic(err)
-			}
-
-			data2, err := toEditor(flag.Arg(1), data, false)
-			if err != nil {
-				panic(err)
-			}
-			updatedBlob, err := dataToBlob(data2.data)
-			if err != nil {
-				panic(err)
-			}
-
-			if _, err := saveBlob(updatedBlob, nil); err != nil {
-				panic(err)
-			}
-
-			// Now we can safely delete the temp file
-			if err := data2.remove(); err != nil {
-				panic(err)
-			}
-
-			_id, err := saveBlob(updatedBlob, nil)
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Printf("Blob %s recovered and saved", _id)
-			return
-		}
-
-		// List all blobs available for recovery
-		d, err := os.Open(cache)
-		if err != nil {
-			printErr("failed to open cache dir", err)
-		}
-		fis, err := d.Readdir(-1)
-		if err != nil {
-			printErr("failed to read cache dir", err)
-		}
-		buf := &bytes.Buffer{}
-		for _, fi := range fis {
-			if strings.HasPrefix(fi.Name(), "blob_") {
-				data, err := ioutil.ReadFile(filepath.Join(cache, fi.Name()))
-				if err != nil {
-					printErr("failed to read restore file", err)
-				}
-				blob, err := dataToBlob(data)
-				if err != nil {
-					printErr("file looks corrupted", err)
-				}
-				blobID := blob.ID
-				// If there's no ID yet, use the timsetamp as ID instead
-				flag := "[N] "
-				if blobID == "" {
-					n := fi.Name()
-					blobID = fi.Name()[5:len(n)]
-					flag = "[UN]"
-				}
-				// TODO(tsileo): tabwriter
-				buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", fi.ModTime().Format("2006-01-02  15:04"), blobID, flag, blob.Title))
-			}
-		}
-		fmt.Printf(buf.String())
-		if err := d.Close(); err != nil {
-			printErr("failed to close cache dir", err)
-		}
-
-	default:
-	}
 }
