@@ -293,6 +293,9 @@ func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) s
 }
 
 type downloadCmd struct {
+	stdout  bool
+	decrypt bool
+
 	col    *docstore.Collection
 	expand func(string) string
 	ds     *docstore.DocStore
@@ -306,9 +309,28 @@ func (*downloadCmd) Usage() string {
 `
 }
 
-func (*downloadCmd) SetFlags(_ *flag.FlagSet) {}
+func (d *downloadCmd) SetFlags(f *flag.FlagSet) {
+	f.BoolVar(&d.stdout, "stdout", false, "output the file content to stdout (only works on 1 file)")
+	f.BoolVar(&d.decrypt, "decrypt", false, "decrypt the file locally")
+}
 
 func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	var r io.Reader
+	var pwd []byte
+	var err error
+	if d.decrypt {
+		fmt.Printf("password:\n")
+		pwd, err = getPass()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if d.stdout && f.NArg() > 1 {
+		fmt.Printf("can only print one file to stdout")
+		return subcommands.ExitFailure
+
+	}
 	for _, id := range f.Args() {
 		blob := &Blob2{}
 		if err := d.col.GetID(d.expand(id), &blob); err != nil {
@@ -318,18 +340,45 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 			panic("not a file")
 		}
 		parts := strings.Split(blob.Ref, ":")
-		rc, err := d.ds.DownloadAttachment(parts[1])
+		r, err = d.ds.DownloadAttachment(parts[1])
 		if err != nil {
+			fmt.Printf("dl error=%v", err)
+
 			return subcommands.ExitFailure
 		}
-		defer rc.Close()
+
+		if pwd != nil && len(pwd) > 0 {
+			box, err := ioutil.ReadAll(r)
+			if err != nil {
+				panic(err)
+
+			}
+			plain, err := open(pwd, box)
+			if err != nil {
+				panic(err)
+
+			}
+			r = bytes.NewReader(plain)
+		}
+		// FIXME(tsileo): ensure the file exists, and provide a -filename flag, even -stdout?
 		// FIXME(tsileo): read the meta filename instead
+		if d.stdout {
+			data, err := ioutil.ReadAll(r)
+			if err != nil {
+				panic(err)
+
+			}
+			fmt.Printf("%s", data)
+			return subcommands.ExitSuccess
+		}
 		output, err := os.Create(blob.Title)
 		if err != nil {
+			fmt.Printf("create err=%v", err)
 			return subcommands.ExitFailure
 		}
 		defer output.Close()
-		if _, err := io.Copy(output, rc); err != nil {
+		if _, err := io.Copy(output, r); err != nil {
+			fmt.Printf("copy err=%v", err)
 			return subcommands.ExitFailure
 		}
 		fmt.Printf("Blob downloaded at %s", blob.Title)
@@ -339,6 +388,8 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 }
 
 type uploadCmd struct {
+	encrypt bool
+
 	col *docstore.Collection
 	ds  *docstore.DocStore
 }
@@ -351,20 +402,47 @@ func (*uploadCmd) Usage() string {
 `
 }
 
-func (*uploadCmd) SetFlags(_ *flag.FlagSet) {}
+func (u *uploadCmd) SetFlags(f *flag.FlagSet) {
+	f.BoolVar(&u.encrypt, "encrypt", false, "encrypt the file locally before uploading")
+}
 
 func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	var r io.Reader
+	var pwd []byte
+	var err error
+	if u.encrypt {
+		fmt.Printf("password:\n")
+		pwd, err = getPass()
+		if err != nil {
+			panic(err)
+		}
+	}
 	// TODO(tsileo): support the -filename and -title flag (only for single upload)
 	// TODO(tsileo): suport the -prefix/-suffix flag (for single and bulk upload)
 	for _, path := range f.Args() {
-		f, err := os.Open(path)
-		defer f.Close()
+		r, err = os.Open(path)
+		if ff, ok := r.(io.Closer); ok {
+			defer ff.Close()
+		}
 		if err != nil {
 			return subcommands.ExitFailure
 		}
+		if pwd != nil && len(pwd) > 0 {
+			data, err := ioutil.ReadAll(r)
+			if err != nil {
+				panic(err)
+			}
+			box, err := seal(pwd, data)
+			if err != nil {
+				panic(err)
+			}
+
+			r = bytes.NewReader(box)
+		}
 		// TODO(tsileo): support encryption
-		ref, err := u.ds.UploadAttachment(filepath.Base(path), f, nil)
+		ref, err := u.ds.UploadAttachment(filepath.Base(path), r, nil)
 		if err != nil {
+			fmt.Printf("err=%v", err)
 			return subcommands.ExitFailure
 		}
 		blob := &Blob2{
