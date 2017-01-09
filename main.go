@@ -2,23 +2,97 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"context"
 	"github.com/google/subcommands"
 	"github.com/mitchellh/go-homedir"
 	"github.com/tsileo/blobstash/pkg/client/docstore"
+	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/crypto/scrypt"
+	"golang.org/x/crypto/ssh/terminal"
 	"gopkg.in/yaml.v2"
 )
+
+// The length of the salt used for scrypt.
+const saltLength = 24
+
+// The length of the nonce used for the secretbox implementation.
+const nonceLength = 24
+
+// The length of the encryption key for the secretbox implementation.
+const keyLength = 32
+
+func getPass() ([]byte, error) {
+	pass, err := terminal.ReadPassword(int(syscall.Stdin))
+	if err != nil {
+		return nil, err
+	}
+	return pass, nil
+}
+func key(password []byte) ([]byte, []byte, error) {
+	salt := make([]byte, saltLength)
+	if _, err := rand.Reader.Read(salt[:]); err != nil {
+		return nil, nil, err
+	}
+	key, err := scrypt.Key(password, salt[:], 16384, 8, 1, keyLength)
+	if err != nil {
+		return nil, nil, err
+
+	}
+	return key, salt, nil
+}
+
+func seal(password, data []byte) ([]byte, error) {
+	key, salt, err := key(password)
+	nkey := new([keyLength]byte)
+	copy(nkey[:], key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := new([nonceLength]byte)
+	if _, err := rand.Reader.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	box := make([]byte, saltLength+nonceLength)
+	copy(box, salt[:])
+	copy(box[saltLength:], nonce[:])
+	return secretbox.Seal(box, data, nonce, nkey), nil
+}
+
+func open(password, data []byte) ([]byte, error) {
+	salt := new([saltLength]byte)
+	copy(salt[:], data[:saltLength])
+	key, err := scrypt.Key(password, salt[:], 16384, 8, 1, keyLength)
+	if err != nil {
+		return nil, err
+	}
+	nkey := new([keyLength]byte)
+	copy(nkey[:], key)
+	if err != nil {
+		return nil, err
+	}
+	nonce := new([nonceLength]byte)
+	copy(nonce[:], data[saltLength:(saltLength+nonceLength)])
+	box := data[(saltLength + nonceLength):]
+	decrypted, success := secretbox.Open(nil, box, nonce, nkey)
+	if !success {
+		return nil, errors.New("failed to decrypt file (bad password?)")
+	}
+	return decrypted, nil
+}
 
 var cache string
 
@@ -244,10 +318,20 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 			panic("not a file")
 		}
 		parts := strings.Split(blob.Ref, ":")
-		if err := d.ds.DownloadAttachment(parts[1], blob.Title); err != nil {
-			panic(err)
+		rc, err := d.ds.DownloadAttachment(parts[1])
+		if err != nil {
+			return subcommands.ExitFailure
 		}
-
+		defer rc.Close()
+		// FIXME(tsileo): read the meta filename instead
+		output, err := os.Create(blob.Title)
+		if err != nil {
+			return subcommands.ExitFailure
+		}
+		defer output.Close()
+		if _, err := io.Copy(output, rc); err != nil {
+			return subcommands.ExitFailure
+		}
 		fmt.Printf("Blob downloaded at %s", blob.Title)
 	}
 	return subcommands.ExitSuccess
@@ -270,10 +354,18 @@ func (*uploadCmd) Usage() string {
 func (*uploadCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	// TODO(tsileo): support the -filename and -title flag (only for single upload)
+	// TODO(tsileo): suport the -prefix/-suffix flag (for single and bulk upload)
 	for _, path := range f.Args() {
-		ref, err := u.ds.UploadAttachment(path)
+		f, err := os.Open(path)
+		defer f.Close()
 		if err != nil {
-			panic(err)
+			return subcommands.ExitFailure
+		}
+		// TODO(tsileo): support encryption
+		ref, err := u.ds.UploadAttachment(filepath.Base(path), f, nil)
+		if err != nil {
+			return subcommands.ExitFailure
 		}
 		blob := &Blob2{
 			Title: filepath.Base(path),
@@ -482,6 +574,7 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) {
 		}
 		t := "[N]"
 		if blob.Type == "file" {
+			// FIXME(tsileo): make the docstore fetch the meta even in query/list mode and support the E flag fo encrypted
 			t = "[F]"
 		}
 		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
