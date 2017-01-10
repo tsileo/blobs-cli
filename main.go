@@ -194,7 +194,7 @@ func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 type editCmd struct {
 	col      *docstore.Collection
 	expand   func(string) string
-	saveBlob func(*Blob, *Blob2) (string, error)
+	saveBlob func(*Blob, *Blob) (string, error)
 }
 
 func (*editCmd) Name() string     { return "edit" }
@@ -208,7 +208,7 @@ func (*editCmd) Usage() string {
 func (*editCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (e *editCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	blob := &Blob2{}
+	blob := &Blob{}
 	if err := e.col.GetID(e.expand(flag.Arg(1)), &blob); err != nil {
 		panic(err)
 	}
@@ -245,7 +245,7 @@ func (e *editCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) 
 
 type newCmd struct {
 	col      *docstore.Collection
-	saveBlob func(*Blob, *Blob2) (string, error)
+	saveBlob func(*Blob, *Blob) (string, error)
 }
 
 func (*newCmd) Name() string     { return "new" }
@@ -332,15 +332,15 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 
 	}
 	for _, id := range f.Args() {
-		blob := &Blob2{}
+		blob := &Blob{}
 		if err := d.col.GetID(d.expand(id), &blob); err != nil {
 			panic(err)
 		}
 		if blob.Type != "file" {
 			panic("not a file")
 		}
-		parts := strings.Split(blob.Ref, ":")
-		r, err = d.ds.DownloadAttachment(parts[1])
+		ref := blob.Ref.(map[string]interface{})["hash"].(string)
+		r, err = d.ds.DownloadAttachment(ref)
 		if err != nil {
 			fmt.Printf("dl error=%v", err)
 
@@ -417,6 +417,7 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 			panic(err)
 		}
 	}
+	var mdata map[string]interface{}
 	// TODO(tsileo): support the -filename and -title flag (only for single upload)
 	// TODO(tsileo): suport the -prefix/-suffix flag (for single and bulk upload)
 	for _, path := range f.Args() {
@@ -438,14 +439,17 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 			}
 
 			r = bytes.NewReader(box)
+			mdata = map[string]interface{}{
+				"encrypted": true,
+			}
 		}
 		// TODO(tsileo): support encryption
-		ref, err := u.ds.UploadAttachment(filepath.Base(path), r, nil)
+		ref, err := u.ds.UploadAttachment(filepath.Base(path), r, mdata)
 		if err != nil {
 			fmt.Printf("err=%v", err)
 			return subcommands.ExitFailure
 		}
-		blob := &Blob2{
+		blob := &Blob{
 			Title: filepath.Base(path),
 			Type:  "file",
 			Ref:   "#blobstash/json:" + ref,
@@ -463,7 +467,7 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 }
 
 type convertCmd struct {
-	saveBlob func(*Blob, *Blob2) (string, error)
+	saveBlob func(*Blob, *Blob) (string, error)
 }
 
 func (*convertCmd) Name() string     { return "convert" }
@@ -511,7 +515,7 @@ func (c *convertCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 }
 
 type recoverCmd struct {
-	saveBlob func(*Blob, *Blob2) (string, error)
+	saveBlob func(*Blob, *Blob) (string, error)
 }
 
 func (*recoverCmd) Name() string     { return "recover" }
@@ -616,19 +620,7 @@ type Blob struct {
 	Content   string                 `json:"content" yaml:"-"`
 	Title     string                 `json:"title" yaml:"title"`
 	Meta      map[string]interface{} `json:"meta,omitempty" yaml:"meta,omitempty"`
-}
-
-type Blob2 struct {
-	CreatedAt int64                  `json:"_created,omitempty" yaml:"-"`
-	Hash      string                 `json:"_hash,omitempty" yaml:"-"`
-	ID        string                 `json:"_id,omitempty" yaml:"_id"`
-	Type      string                 `json:"_type" yaml:"-"`
-	UpdatedAt int64                  `json:"_updated,omitempty" yaml:"-"`
-	Archived  bool                   `json:"archived" yaml:"archived"`
-	Content   string                 `json:"content" yaml:"-"`
-	Title     string                 `json:"title" yaml:"title"`
-	Ref       string                 `json:"_ref,omitempty" yaml:"-"` // FIXME(tsileo): ref shouldn't be a string in BlobStash response
-	Meta      map[string]interface{} `json:"meta,omitempty" yaml:"meta,omitempty"`
+	Ref       interface{}            `json:"_ref" yaml:"-"`
 }
 
 type BlobYAMLHeader struct {
@@ -650,10 +642,15 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) {
 		if blob.UpdatedAt != 0 {
 			updated = blob.UpdatedAt
 		}
-		t := "[N]"
+		t := "[N] "
 		if blob.Type == "file" {
 			// FIXME(tsileo): make the docstore fetch the meta even in query/list mode and support the E flag fo encrypted
-			t = "[F]"
+			t = "[F] "
+			if d, ok := blob.Ref.(map[string]interface{})["data"]; ok {
+				if e, ok := d.(map[string]interface{})["encrypted"]; ok && e.(bool) {
+					t = "[EF]"
+				}
+			}
 		}
 		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
 		if _, ok := index[shortHash]; ok {
@@ -750,7 +747,7 @@ func main() {
 	// TODO(tsileo) config file with server address and collection name
 	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
 	ds := docstore.New(opts)
-	col := ds.Col("notes21")
+	col := ds.Col("notes22")
 
 	var err error
 	// Init cache
@@ -779,7 +776,7 @@ func main() {
 		return id
 	}
 
-	saveBlob := func(blob *Blob, prevBlob *Blob2) (string, error) {
+	saveBlob := func(blob *Blob, prevBlob *Blob) (string, error) {
 		fmt.Printf("saveBlob(%+v, %+v)\n", blob, prevBlob)
 		// Blob update handling
 		if prevBlob != nil && prevBlob.ID != "" {
@@ -787,6 +784,7 @@ func main() {
 			// Ensure the blob has been modified
 			if blob.Title != prevBlob.Title || blob.Content != prevBlob.Content {
 				fmt.Printf("updated %s %+v", prevBlob.ID, blob)
+				// FIXME(tsileo): use patch instead
 				return prevBlob.ID, col.UpdateID(prevBlob.ID, blob)
 			}
 			return prevBlob.ID, nil
