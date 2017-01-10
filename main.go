@@ -26,6 +26,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// TODO(tsileo): use JSONPatch, ETag, and ask for password on encrypted file
+
 // The length of the salt used for scrypt.
 const saltLength = 24
 
@@ -36,12 +38,15 @@ const nonceLength = 24
 const keyLength = 32
 
 func getPass() ([]byte, error) {
+	fmt.Printf("password:")
 	pass, err := terminal.ReadPassword(int(syscall.Stdin))
+	fmt.Printf("\n")
 	if err != nil {
 		return nil, err
 	}
 	return pass, nil
 }
+
 func key(password []byte) ([]byte, []byte, error) {
 	salt := make([]byte, saltLength)
 	if _, err := rand.Reader.Read(salt[:]); err != nil {
@@ -101,6 +106,7 @@ var errCacheFileExist = errors.New("cache file already exist")
 func printErr(msg string, err error) {
 	fmt.Printf("%s: %v", msg, err)
 	os.Exit(1)
+	// TODO(tsileo): returns the Exit...
 }
 
 func cacheDir() (string, error) {
@@ -319,7 +325,6 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 	var pwd []byte
 	var err error
 	if d.decrypt {
-		fmt.Printf("password:\n")
 		pwd, err = getPass()
 		if err != nil {
 			panic(err)
@@ -411,7 +416,6 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 	var pwd []byte
 	var err error
 	if u.encrypt {
-		fmt.Printf("password:\n")
 		pwd, err = getPass()
 		if err != nil {
 			panic(err)
