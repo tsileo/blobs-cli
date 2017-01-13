@@ -26,7 +26,8 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// TODO(tsileo): use JSONPatch, ETag, and ask for password on encrypted file
+// TODO(tsileo): use JSONPatch, ETag, not panic on error (like bad error)
+// FIXME(tsileo): ability to pipe commands redis-cli like
 
 // The length of the salt used for scrypt.
 const saltLength = 24
@@ -36,6 +37,11 @@ const nonceLength = 24
 
 // The length of the encryption key for the secretbox implementation.
 const keyLength = 32
+
+// Set a flag to identify the encryption algorithm in case we support/switch encryption scheme later
+const (
+	naclSecretBox byte = 1 << iota
+)
 
 func getPass() ([]byte, error) {
 	fmt.Printf("password:")
@@ -47,11 +53,13 @@ func getPass() ([]byte, error) {
 	return pass, nil
 }
 
+// key returns the key, along with the salt
 func key(password []byte) ([]byte, []byte, error) {
 	salt := make([]byte, saltLength)
 	if _, err := rand.Reader.Read(salt[:]); err != nil {
 		return nil, nil, err
 	}
+	// TODO(tsileo): make the scrypt parameters constant
 	key, err := scrypt.Key(password, salt[:], 16384, 8, 1, keyLength)
 	if err != nil {
 		return nil, nil, err
@@ -60,6 +68,7 @@ func key(password []byte) ([]byte, []byte, error) {
 	return key, salt, nil
 }
 
+// Seal the data with the key derived from `password` (using scrypt) and seal the data with nacl/secretbox
 func seal(password, data []byte) ([]byte, error) {
 	key, salt, err := key(password)
 	nkey := new([keyLength]byte)
@@ -71,15 +80,26 @@ func seal(password, data []byte) ([]byte, error) {
 	if _, err := rand.Reader.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	box := make([]byte, saltLength+nonceLength)
-	copy(box, salt[:])
-	copy(box[saltLength:], nonce[:])
+	// Box will contains our meta data (alg byte + salt + nonce)
+	box := make([]byte, saltLength+nonceLength+1)
+	// Store the alg byte
+	box[0] = naclSecretBox
+	// The salt
+	copy(box[1:], salt[:])
+	// And the nonce
+	copy(box[saltLength+1:], nonce[:])
 	return secretbox.Seal(box, data, nonce, nkey), nil
 }
 
+// Open a previously sealed secretbox with the key derived from `password` (using scrypt)
 func open(password, data []byte) ([]byte, error) {
+	if data[0] != naclSecretBox {
+		return nil, fmt.Errorf("invalid/unsupported encryption scheme: %v", data[0]) // XXX(tsileo): is scheme the right word?
+	}
+	// Extract the salt
 	salt := new([saltLength]byte)
-	copy(salt[:], data[:saltLength])
+	copy(salt[:], data[1:saltLength+1])
+	// Re-derivate the key
 	key, err := scrypt.Key(password, salt[:], 16384, 8, 1, keyLength)
 	if err != nil {
 		return nil, err
@@ -89,19 +109,29 @@ func open(password, data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Extract the nonce
 	nonce := new([nonceLength]byte)
-	copy(nonce[:], data[saltLength:(saltLength+nonceLength)])
-	box := data[(saltLength + nonceLength):]
+	copy(nonce[:], data[saltLength+1:(saltLength+nonceLength+1)])
+	box := data[(saltLength + nonceLength + 1):]
+	// Actually decrypt the cipher text
 	decrypted, success := secretbox.Open(nil, box, nonce, nkey)
+
+	// Ensure the decryption succeed
 	if !success {
 		return nil, errors.New("failed to decrypt file (bad password?)")
 	}
+
 	return decrypted, nil
 }
 
 var cache string
 
 var errCacheFileExist = errors.New("cache file already exist")
+
+func rerr(msg string, a ...interface{}) subcommands.ExitStatus {
+	fmt.Printf(msg, a...)
+	return subcommands.ExitFailure
+}
 
 func printErr(msg string, err error) {
 	fmt.Printf("%s: %v", msg, err)
@@ -300,7 +330,7 @@ func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) s
 
 type downloadCmd struct {
 	stdout  bool
-	decrypt bool
+	decrypt bool // Optional in case one's want to download the file encrypted? XXX(ts): worth it?
 
 	col    *docstore.Collection
 	expand func(string) string
@@ -393,7 +423,11 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 }
 
 type uploadCmd struct {
-	encrypt bool
+	encrypt  bool
+	filename string
+	title    string
+	prefix   string
+	suffix   string
 
 	col *docstore.Collection
 	ds  *docstore.DocStore
@@ -409,6 +443,9 @@ func (*uploadCmd) Usage() string {
 
 func (u *uploadCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&u.encrypt, "encrypt", false, "encrypt the file locally before uploading")
+	f.StringVar(&u.filename, "filename", "", "override the filename (dont't work with bulk uploads)")
+	f.StringVar(&u.prefix, "prefix", "", "prepend the prefix to filenames")
+	f.StringVar(&u.suffix, "suffix", "", "append the suffix to filenames") // XXX(tsileo): check the spelling of suffix?
 }
 
 func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -418,28 +455,32 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 	if u.encrypt {
 		pwd, err = getPass()
 		if err != nil {
-			panic(err)
+			return rerr("failed to get password: %s", err)
 		}
 	}
-	var mdata map[string]interface{}
-	// TODO(tsileo): support the -filename and -title flag (only for single upload)
-	// TODO(tsileo): suport the -prefix/-suffix flag (for single and bulk upload)
+
+	// Quick check
+	if f.NArg() > 1 && (u.filename != "" || u.title != "") {
+		return rerr("-filename and -title cant be used for bulk uploads")
+	}
+
 	for _, path := range f.Args() {
+		var mdata map[string]interface{}
 		r, err = os.Open(path)
 		if ff, ok := r.(io.Closer); ok {
 			defer ff.Close()
 		}
 		if err != nil {
-			return subcommands.ExitFailure
+			return rerr("failed to open file at %s: %s", path, err)
 		}
 		if pwd != nil && len(pwd) > 0 {
 			data, err := ioutil.ReadAll(r)
 			if err != nil {
-				panic(err)
+				return rerr("failed to read file at %s: %s", path, err)
 			}
 			box, err := seal(pwd, data)
 			if err != nil {
-				panic(err)
+				return rerr("failed to encrypt file at %s: %s", path, err)
 			}
 
 			r = bytes.NewReader(box)
@@ -447,24 +488,36 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 				"encrypted": true,
 			}
 		}
-		// TODO(tsileo): support encryption
-		ref, err := u.ds.UploadAttachment(filepath.Base(path), r, mdata)
-		if err != nil {
-			fmt.Printf("err=%v", err)
-			return subcommands.ExitFailure
+		fname := filepath.Base(path)
+
+		fmt.Printf("u=%+v", u)
+
+		if u.prefix != "" || u.suffix != "" {
+			fname = u.prefix + fname + u.suffix
 		}
+
+		// Override the filename if the flag is set
+		if u.filename != "" {
+			fname = u.filename
+		}
+
+		ref, err := u.ds.UploadAttachment(fname, r, mdata)
+		if err != nil {
+			// XXX(tsileo): in this case, there won't be any reference to it if the upload is not retried
+			return rerr("failed to upload file at %s: %s", path, err)
+		}
+		// Now we can create the Blob
 		blob := &Blob{
-			Title: filepath.Base(path),
+			Title: fname,
 			Type:  "file",
 			Ref:   "#blobstash/json:" + ref,
 		}
 		_id, err := u.col.Insert(blob, nil)
 		if err != nil {
-			// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it
-			panic(err)
+			// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it?
+			return rerr("failed to create blob: %s", err)
 		}
-		fmt.Printf("Blob %s created", _id.String())
-
+		fmt.Printf(_id.String())
 	}
 
 	return subcommands.ExitSuccess
@@ -478,7 +531,7 @@ func (*convertCmd) Name() string     { return "convert" }
 func (*convertCmd) Synopsis() string { return "Create a new blob using the file content" }
 func (*convertCmd) Usage() string {
 	return `convert <path> <path> <...>:
-  Print args to stdout.
+	Convert the content of the given files as Blobs.
 `
 }
 
@@ -648,7 +701,6 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) {
 		}
 		t := "[N] "
 		if blob.Type == "file" {
-			// FIXME(tsileo): make the docstore fetch the meta even in query/list mode and support the E flag fo encrypted
 			t = "[F] "
 			if d, ok := blob.Ref.(map[string]interface{})["data"]; ok {
 				if e, ok := d.(map[string]interface{})["encrypted"]; ok && e.(bool) {
@@ -751,7 +803,7 @@ func main() {
 	// TODO(tsileo) config file with server address and collection name
 	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
 	ds := docstore.New(opts)
-	col := ds.Col("notes22")
+	col := ds.Col("notes23")
 
 	var err error
 	// Init cache
