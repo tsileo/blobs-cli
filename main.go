@@ -14,12 +14,13 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
+	"a4.io/blobstash/pkg/client/docstore"
 	"context"
 	"github.com/google/subcommands"
 	"github.com/mitchellh/go-homedir"
-	"github.com/tsileo/blobstash/pkg/client/docstore"
 	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/crypto/ssh/terminal"
@@ -174,7 +175,7 @@ func (*recentCmd) Usage() string {
 func (*recentCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (r *recentCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	iter, err := r.col.Iter(nil, nil)
+	iter, err := r.col.Iter(nil, &docstore.IterOpts{Limit: 10})
 	if err != nil {
 		panic(err)
 	}
@@ -690,8 +691,51 @@ type BlobResponse struct {
 	Blobs []*Blob `json:"data"`
 }
 
-// XXX(tsileo): tabwriter?
 func fmtBlobs(blobs []*Blob, shortHashLen int) {
+	w := new(tabwriter.Writer)
+	// Format in tab-separated columns with a tab stop of 8.
+	w.Init(os.Stdout, 0, 8, 0, '\t', 0)
+	// fmt.Fprintln(w, "a\tb\tc\td\t.")
+
+	// buf := bytes.Buffer{}
+	index := map[string]string{}
+	for _, blob := range blobs {
+		updated := blob.CreatedAt
+		if blob.UpdatedAt != 0 {
+			updated = blob.UpdatedAt
+		}
+		t := "[N] "
+		if blob.Type == "file" {
+			t = "[F] "
+			if d, ok := blob.Ref.(map[string]interface{})["data"]; ok {
+				if e, ok := d.(map[string]interface{})["encrypted"]; ok && e.(bool) {
+					t = "[EF]"
+				}
+			}
+		}
+		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
+		if _, ok := index[shortHash]; ok {
+			fmtBlobs(blobs, shortHashLen+1)
+			return
+		}
+		index[shortHash] = blob.ID
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", time.Unix(updated, 0).Format("2006-01-02  15:04"), shortHash, t, blob.Title)
+	}
+
+	data, err := json.Marshal(index)
+	if err != nil {
+		panic(err)
+	}
+	if err := ioutil.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")), data, 0644); err != nil {
+		panic(err)
+	}
+	// fmt.Fprintln(w, "123\t12345\t1234567\t123456789\t.")
+	fmt.Fprintln(w)
+	w.Flush()
+}
+
+// XXX(tsileo): tabwriter?
+func fmtBlobsold(blobs []*Blob, shortHashLen int) {
 	buf := bytes.Buffer{}
 	index := map[string]string{}
 	for _, blob := range blobs {
