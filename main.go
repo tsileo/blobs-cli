@@ -27,7 +27,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// TODO(tsileo): use JSONPatch, ETag, not panic on error (like bad error)
+// TODO(tsileo): use JSONPatch, ETag
 // FIXME(tsileo): ability to pipe commands redis-cli like
 
 // The length of the salt used for scrypt.
@@ -44,6 +44,7 @@ const (
 	naclSecretBox byte = 1 << iota
 )
 
+// getPass display the password input
 func getPass() ([]byte, error) {
 	fmt.Printf("password:")
 	pass, err := terminal.ReadPassword(int(syscall.Stdin))
@@ -134,10 +135,9 @@ func rerr(msg string, a ...interface{}) subcommands.ExitStatus {
 	return subcommands.ExitFailure
 }
 
-func printErr(msg string, err error) {
-	fmt.Printf("%s: %v", msg, err)
-	os.Exit(1)
-	// TODO(tsileo): returns the Exit...
+func rsuccess(msg string, a ...interface{}) subcommands.ExitStatus {
+	fmt.Printf(msg, a...)
+	return subcommands.ExitSuccess
 }
 
 func cacheDir() (string, error) {
@@ -177,12 +177,12 @@ func (*recentCmd) SetFlags(_ *flag.FlagSet) {}
 func (r *recentCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
 	iter, err := r.col.Iter(nil, &docstore.IterOpts{Limit: 10})
 	if err != nil {
-		panic(err)
+		return rerr("failed to call BlobStash: %v", err)
 	}
 	resp := &BlobResponse{}
 	iter.Next(resp)
 	if err := iter.Err(); err != nil {
-		panic(err)
+		return rerr("iteration error: %v", err)
 	}
 	// FIXME(tsileo): an option to display full hash
 	fmtBlobs(resp.Blobs, 3)
@@ -206,8 +206,7 @@ func (*searchCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
 	if flag.Arg(1) == "" {
-		fmt.Printf("no query")
-		return subcommands.ExitSuccess
+		return rsuccess("missing query")
 	}
 	iter, err := s.col.Iter(&docstore.Query{
 		StoredQuery: "blobs-search",
@@ -217,12 +216,12 @@ func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 		},
 	}, nil)
 	if err != nil {
-		panic(err)
+		return rerr("failed to execute BlobStash query: %v", err)
 	}
 	resp := &BlobResponse{}
 	iter.Next(resp)
 	if err := iter.Err(); err != nil {
-		panic(err)
+		return rerr("iterator error: %v", err)
 	}
 	fmtBlobs(resp.Blobs, 3)
 	return subcommands.ExitSuccess
@@ -247,35 +246,35 @@ func (*editCmd) SetFlags(_ *flag.FlagSet) {}
 func (e *editCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
 	blob := &Blob{}
 	if err := e.col.GetID(e.expand(flag.Arg(1)), &blob); err != nil {
-		panic(err)
+		return rerr("failed to retrieve document from BlobStash: %v", err)
 	}
 	if blob.Type != "note" {
-		panic("not a note")
+		return rerr("blob is not a note, got \"%s\"", blob.Type)
 	}
 	out := []byte("---\n")
 	d, err := yaml.Marshal(blob)
 	if err != nil {
-		panic(err)
+		return rerr("failed to marshal blob as JSON: %v", err)
 	}
 	out = append(out, d...)
 	out = append(out, []byte("---\n")...)
 	out = append(out, []byte(blob.Content)...)
 	data, err := toEditor(blob.ID, out, true)
 	if err != nil {
-		panic(err)
+		return rerr("failed to edit blob: %v", err)
 	}
 	updatedBlob, err := dataToBlob(data.data)
 	if err != nil {
-		panic(err)
+		return rerr("failed to unserialize blob: %v", err)
 	}
 
 	if _, err := e.saveBlob(updatedBlob, blob); err != nil {
-		panic(err)
+		return rerr("failed to save blob: %v", err)
 	}
 
 	// Now we can safely delete the temp file
 	if err := data.remove(); err != nil {
-		panic(err)
+		return rerr("failed to remove temporary file: %v", err)
 	}
 	return subcommands.ExitSuccess
 }
@@ -299,11 +298,11 @@ func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) s
 	out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
 	data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
 	if err != nil {
-		panic(err)
+		return rerr("failed to edit blob: %v", err)
 	}
 	updatedBlob, err := dataToBlob(data.data)
 	if err != nil {
-		panic(err)
+		return rerr("failed to unserialize blob: %v", err)
 	}
 
 	// TODO(tsileo): a warning on empty notes?
@@ -311,17 +310,12 @@ func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) s
 
 	_id, err := n.saveBlob(updatedBlob, nil)
 	if err != nil {
-		panic(err)
+		return rerr("failed to save blob: %v", err)
 	}
-
-	// _id, err := col.Insert(updatedBlob, nil)
-	// if err != nil {
-	// 	panic(err)
-	// }
 
 	// Now we can safely delete the temp file
 	if err := data.remove(); err != nil {
-		panic(err)
+		return rerr("failed to remove temporary file: %v")
 	}
 
 	fmt.Printf("Blob %s created", _id)
@@ -358,7 +352,7 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 	if d.decrypt {
 		pwd, err = getPass()
 		if err != nil {
-			panic(err)
+			return rerr("failed to read password: %v", err)
 		}
 	}
 
@@ -370,10 +364,10 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 	for _, id := range f.Args() {
 		blob := &Blob{}
 		if err := d.col.GetID(d.expand(id), &blob); err != nil {
-			panic(err)
+			return rerr("failed to fetch document from BlobStash: %v", err)
 		}
 		if blob.Type != "file" {
-			panic("not a file")
+			return rerr("blob is not a file, got \"%s\"", blob.Type)
 		}
 		ref := blob.Ref.(map[string]interface{})["hash"].(string)
 		r, err = d.ds.DownloadAttachment(ref)
@@ -386,12 +380,12 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 		if pwd != nil && len(pwd) > 0 {
 			box, err := ioutil.ReadAll(r)
 			if err != nil {
-				panic(err)
-
+				return rerr("failed to read attachment: %v", err)
 			}
 			plain, err := open(pwd, box)
 			if err != nil {
-				panic(err)
+				// TODO(tsileo): handle the bad password error with a custom error message
+				return rerr("failed to decrypt file: %v", err)
 
 			}
 			r = bytes.NewReader(plain)
@@ -401,7 +395,7 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 		if d.stdout {
 			data, err := ioutil.ReadAll(r)
 			if err != nil {
-				panic(err)
+				return rerr("failed to read file: %v", err)
 
 			}
 			fmt.Printf("%s", data)
@@ -542,29 +536,29 @@ func (c *convertCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 	// FIXME(tsileo): allow to convert multiple files without opening them
 	orig, err := ioutil.ReadFile(flag.Arg(1))
 	if err != nil {
-		panic(err)
+		return rerr("failed to read source file (\"%s\"): %v", flag.Arg(1), err)
 	}
 	title := filepath.Base(flag.Arg(1))
 	out := []byte(fmt.Sprintf("---\narchived: false\ntitle: '%s'\n---\n", title))
 	out = append(out, orig...)
 	data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
 	if err != nil {
-		panic(err)
+		return rerr("failed to edit blob: %v", err)
 	}
 
 	updatedBlob, err := dataToBlob(data.data)
 	if err != nil {
-		panic(err)
+		return rerr("failed to unserialize blob: %v", err)
 	}
 
 	_id, err := c.saveBlob(updatedBlob, nil)
 	if err != nil {
-		panic(err)
+		return rerr("failed to save blob: %v", err)
 	}
 
 	// Now we can safely delete the temp file
 	if err := data.remove(); err != nil {
-		panic(err)
+		return rerr("failed to remove temporary file: %v", err)
 	}
 
 	fmt.Printf("Blob %s created", _id)
@@ -592,34 +586,29 @@ func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 		data, err := ioutil.ReadFile(filepath.Join(cache, fmt.Sprintf("blob_%s", flag.Arg(1))))
 		switch {
 		case os.IsNotExist(err):
-			fmt.Printf("No such blob to recover")
-			return subcommands.ExitSuccess
+			return rerr("no such blob")
 		case err == nil:
 		default:
-			panic(err)
+			return rerr("failed to read source file: %v", err)
 		}
 
 		data2, err := toEditor(flag.Arg(1), data, false)
 		if err != nil {
-			panic(err)
+			return rerr("failed to edit blob: %v", err)
 		}
 		updatedBlob, err := dataToBlob(data2.data)
 		if err != nil {
-			panic(err)
-		}
-
-		if _, err := r.saveBlob(updatedBlob, nil); err != nil {
-			panic(err)
-		}
-
-		// Now we can safely delete the temp file
-		if err := data2.remove(); err != nil {
-			panic(err)
+			return rerr("failed to unserialize blob: %v", err)
 		}
 
 		_id, err := r.saveBlob(updatedBlob, nil)
 		if err != nil {
-			panic(err)
+			return rerr("failed to save blob: %v", err)
+		}
+
+		// Now we can safely delete the temp file
+		if err := data2.remove(); err != nil {
+			return rerr("failed to remove temporary file: %v", err)
 		}
 
 		fmt.Printf("Blob %s recovered and saved", _id)
@@ -629,22 +618,22 @@ func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 	// List all blobs available for recovery
 	d, err := os.Open(cache)
 	if err != nil {
-		printErr("failed to open cache dir", err)
+		return rerr("failed to open cache dir: %v", err)
 	}
 	fis, err := d.Readdir(-1)
 	if err != nil {
-		printErr("failed to read cache dir", err)
+		return rerr("failed to read cache dir: %v", err)
 	}
 	buf := &bytes.Buffer{}
 	for _, fi := range fis {
 		if strings.HasPrefix(fi.Name(), "blob_") {
 			data, err := ioutil.ReadFile(filepath.Join(cache, fi.Name()))
 			if err != nil {
-				printErr("failed to read restore file", err)
+				return rerr("failed to read restore file: %v", err)
 			}
 			blob, err := dataToBlob(data)
 			if err != nil {
-				printErr("file looks corrupted", err)
+				return rerr("file looks corrupted: %v", err)
 			}
 			blobID := blob.ID
 			// If there's no ID yet, use the timsetamp as ID instead
@@ -660,7 +649,7 @@ func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 	}
 	fmt.Printf(buf.String())
 	if err := d.Close(); err != nil {
-		printErr("failed to close cache dir", err)
+		return rerr("failed to close cache dir: %v", err)
 	}
 	return subcommands.ExitSuccess
 }
@@ -691,7 +680,7 @@ type BlobResponse struct {
 	Blobs []*Blob `json:"data"`
 }
 
-func fmtBlobs(blobs []*Blob, shortHashLen int) {
+func fmtBlobs(blobs []*Blob, shortHashLen int) error {
 	w := new(tabwriter.Writer)
 	// Format in tab-separated columns with a tab stop of 8.
 	w.Init(os.Stdout, 0, 8, 0, '\t', 0)
@@ -715,8 +704,7 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) {
 		}
 		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
 		if _, ok := index[shortHash]; ok {
-			fmtBlobs(blobs, shortHashLen+1)
-			return
+			return fmtBlobs(blobs, shortHashLen+1)
 		}
 		index[shortHash] = blob.ID
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", time.Unix(updated, 0).Format("2006-01-02  15:04"), shortHash, t, blob.Title)
@@ -724,50 +712,15 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) {
 
 	data, err := json.Marshal(index)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	if err := ioutil.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")), data, 0644); err != nil {
-		panic(err)
+		return err
 	}
 	// fmt.Fprintln(w, "123\t12345\t1234567\t123456789\t.")
 	fmt.Fprintln(w)
 	w.Flush()
-}
-
-// XXX(tsileo): tabwriter?
-func fmtBlobsold(blobs []*Blob, shortHashLen int) {
-	buf := bytes.Buffer{}
-	index := map[string]string{}
-	for _, blob := range blobs {
-		updated := blob.CreatedAt
-		if blob.UpdatedAt != 0 {
-			updated = blob.UpdatedAt
-		}
-		t := "[N] "
-		if blob.Type == "file" {
-			t = "[F] "
-			if d, ok := blob.Ref.(map[string]interface{})["data"]; ok {
-				if e, ok := d.(map[string]interface{})["encrypted"]; ok && e.(bool) {
-					t = "[EF]"
-				}
-			}
-		}
-		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
-		if _, ok := index[shortHash]; ok {
-			fmtBlobs(blobs, shortHashLen+1)
-			return
-		}
-		index[shortHash] = blob.ID
-		buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", time.Unix(updated, 0).Format("2006-01-02  15:04"), shortHash, t, blob.Title))
-	}
-	data, err := json.Marshal(index)
-	if err != nil {
-		panic(err)
-	}
-	if err := ioutil.WriteFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")), data, 0644); err != nil {
-		panic(err)
-	}
-	fmt.Printf("%s", buf.String())
+	return nil
 }
 
 type editedBlob struct {
@@ -843,6 +796,28 @@ type searchQuery struct {
 	QueryString string   `json:"qs"`
 }
 
+func getExpander() (func(string) string, error) {
+	// Try to load the previous shortID cache index if present
+	index := map[string]string{}
+	orig, err := ioutil.ReadFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	} else {
+		if orig != nil && len(orig) > 0 {
+			if err := json.Unmarshal(orig, &index); err != nil {
+				return nil, err
+			}
+		}
+	}
+	expand := func(id string) string {
+		if expanded, ok := index[id]; ok {
+			return expanded
+		}
+		return id
+	}
+	return expand, nil
+}
+
 func main() {
 	// TODO(tsileo) config file with server address and collection name
 	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
@@ -857,23 +832,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Try to load the previous shortID cache index if present
-	index := map[string]string{}
-	orig, err := ioutil.ReadFile(filepath.Join(os.TempDir(), fmt.Sprintf("blobs_refs_index.json")))
-	if err != nil && !os.IsNotExist(err) {
-		panic(err)
-	} else {
-		if orig != nil && len(orig) > 0 {
-			if err := json.Unmarshal(orig, &index); err != nil {
-				panic(err)
-			}
-		}
-	}
-	expand := func(id string) string {
-		if expanded, ok := index[id]; ok {
-			return expanded
-		}
-		return id
+	expand, err := getExpander()
+	if err != nil {
+		fmt.Printf("failed to load short IDs index: %v", err)
+		os.Exit(1)
 	}
 
 	saveBlob := func(blob *Blob, prevBlob *Blob) (string, error) {
