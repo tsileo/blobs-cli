@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
@@ -158,6 +159,45 @@ func cacheDir() (string, error) {
 	}
 
 	return p, nil
+}
+
+type echoCmd struct {
+	expand func(string) string
+}
+
+func (*echoCmd) Name() string     { return "echo" }
+func (*echoCmd) Synopsis() string { return "echo" }
+func (*echoCmd) Usage() string {
+	return `echo :
+	Echo.
+`
+}
+
+func (*echoCmd) SetFlags(_ *flag.FlagSet) {}
+
+func (e *echoCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	ids := IDsFromStdin(e.expand)
+	if ids != nil {
+		for _, id := range ids {
+			fmt.Printf("id=%s\n", id)
+		}
+	}
+	return subcommands.ExitSuccess
+}
+
+// IDsFromStdin reads the output of a previous commands and returns the blob IDs.
+// $ blobs search tag:mytag type:file | blobs download -
+func IDsFromStdin(expandFunc func(string) string) []string {
+	var ids []string
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		data := strings.Split(scanner.Text(), "\t")
+		if len(data) < 2 {
+			break
+		}
+		ids = append(ids, expandFunc(data[1]))
+	}
+	return ids
 }
 
 type recentCmd struct {
@@ -868,6 +908,9 @@ func main() {
 	subcommands.Register(subcommands.CommandsCommand(), "")
 	subcommands.Register(&recentCmd{col}, "")
 	subcommands.Register(&searchCmd{col}, "")
+	// subcommands.Register(&echoCmd{
+	// 	expand: expand,
+	// }, "")
 	subcommands.Register(&editCmd{
 		col:      col,
 		saveBlob: saveBlob,
