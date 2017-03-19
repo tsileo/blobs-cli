@@ -219,12 +219,13 @@ func (r *recentCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 	if err != nil {
 		return rerr("failed to call BlobStash: %v", err)
 	}
-	resp := &BlobResponse{}
+	resp := &BlobsResponse{}
 	iter.Next(resp)
 	if err := iter.Err(); err != nil {
 		return rerr("iteration error: %v", err)
 	}
 	// FIXME(tsileo): an option to display full hash
+	resp.parsePointers()
 	fmtBlobs(resp.Blobs, 3)
 
 	return subcommands.ExitSuccess
@@ -245,6 +246,7 @@ func (*searchCmd) Usage() string {
 func (*searchCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	// FIXME(tsileo) f.Arg(0) instead of flag.Arg(1)
 	if flag.Arg(1) == "" {
 		return rsuccess("missing query")
 	}
@@ -258,11 +260,12 @@ func (s *searchCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 	if err != nil {
 		return rerr("failed to execute BlobStash query: %v", err)
 	}
-	resp := &BlobResponse{}
+	resp := &BlobsResponse{}
 	iter.Next(resp)
 	if err := iter.Err(); err != nil {
 		return rerr("iterator error: %v", err)
 	}
+	resp.parsePointers()
 	fmtBlobs(resp.Blobs, 3)
 	return subcommands.ExitSuccess
 }
@@ -284,12 +287,14 @@ func (*editCmd) Usage() string {
 func (*editCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (e *editCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	blob := &Blob{}
-	if err := e.col.GetID(e.expand(flag.Arg(1)), &blob); err != nil {
+	blobResp := &BlobResponse{}
+	if err := e.col.GetID(e.expand(flag.Arg(1)), &blobResp); err != nil {
 		return rerr("failed to retrieve document from BlobStash: %v", err)
 	}
-	if blob.Type != "note" {
-		return rerr("blob is not a note, got \"%s\"", blob.Type)
+	blobResp.parsePointers()
+	blob := blobResp.Blob
+	if blob.Kind != "note" {
+		return rerr("blob is not a note, got \"%s\"", blob.Kind)
 	}
 	out := []byte("---\n")
 	d, err := yaml.Marshal(blob)
@@ -402,14 +407,17 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 
 	}
 	for _, id := range f.Args() {
-		blob := &Blob{}
-		if err := d.col.GetID(d.expand(id), &blob); err != nil {
+		blobResp := &BlobResponse{}
+		if err := d.col.GetID(d.expand(id), &blobResp); err != nil {
 			return rerr("failed to fetch document from BlobStash: %v", err)
 		}
-		if blob.Type != "file" {
-			return rerr("blob is not a file, got \"%s\"", blob.Type)
+		fmt.Printf("br=%+v\n", blobResp)
+		blobResp.parsePointers()
+		blob := blobResp.Blob
+		if blob.Kind != "file" {
+			return rerr("blob is not a file, got \"%s\"", blob.Kind)
 		}
-		ref := blob.Ref.(map[string]interface{})["hash"].(string)
+		ref := blob.File["hash"].(string)
 		r, err = d.ds.DownloadAttachment(ref)
 		if err != nil {
 			fmt.Printf("dl error=%v", err)
@@ -544,8 +552,8 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 		// Now we can create the Blob
 		blob := &Blob{
 			Title: fname,
-			Type:  "file",
-			Ref:   "#blobstash/json:" + ref,
+			Kind:  "file",
+			Ref:   "@filetree/ref:" + ref,
 		}
 		_id, err := u.col.Insert(blob, nil)
 		if err != nil {
@@ -697,27 +705,80 @@ func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 type FileRef struct {
 	Hash string `json:"hash"`
 }
+
+// TODO(tsileo): make Blob.Created() (time.Time, error) / Updated
 type Blob struct {
-	CreatedAt int64                  `json:"_created,omitempty" yaml:"-"`
+	CreatedAt string                 `json:"_created,omitempty" yaml:"-"`
 	Hash      string                 `json:"_hash,omitempty" yaml:"-"`
 	ID        string                 `json:"_id,omitempty" yaml:"_id"`
-	Type      string                 `json:"_type" yaml:"-"`
-	UpdatedAt int64                  `json:"_updated,omitempty" yaml:"-"`
+	Kind      string                 `json:"kind" yaml:"-"`
+	UpdatedAt string                 `json:"_updated,omitempty" yaml:"-"`
 	Archived  bool                   `json:"archived" yaml:"archived"`
+	Tags      []string               `json:"tags" yaml:"tags"`
 	Content   string                 `json:"content" yaml:"-"`
 	Title     string                 `json:"title" yaml:"title"`
 	Meta      map[string]interface{} `json:"meta,omitempty" yaml:"meta,omitempty"`
-	Ref       interface{}            `json:"_ref" yaml:"-"`
+	Ref       string                 `json:"ref" yaml:"-"`
+	File      map[string]interface{} `json:"-" yaml:"-"`
+}
+
+func (b *Blob) Created() (time.Time, error) {
+	var t time.Time
+	if b.CreatedAt == "" {
+		return t, nil
+	}
+	created, err := time.Parse(time.RFC3339, b.CreatedAt)
+	if err != nil {
+		return t, err
+	}
+	return created, nil
+}
+
+func (b *Blob) Updated() (time.Time, error) {
+	var t time.Time
+	if b.UpdatedAt == "" {
+		return b.Created()
+	}
+	updated, err := time.Parse(time.RFC3339, b.UpdatedAt)
+	if err != nil {
+		return t, err
+	}
+	return updated, nil
 }
 
 type BlobYAMLHeader struct {
 	Archived bool                   `yaml:"archived"`
 	Title    string                 `yaml:"title"`
 	Meta     map[string]interface{} `yaml:"meta,omitempty"`
+	Tags     []string               `yaml:"tags"`
+}
+
+type BlobsResponse struct {
+	Blobs    []*Blob                           `json:"data"`
+	Pointers map[string]map[string]interface{} `json:"pointers"`
+	// TODO(tsileo): handle pagination
+}
+
+func (br *BlobsResponse) parsePointers() {
+	for _, b := range br.Blobs {
+		if ref, ok := br.Pointers[b.Ref]; ok {
+			b.File = ref
+		}
+	}
 }
 
 type BlobResponse struct {
-	Blobs []*Blob `json:"data"`
+	Blob     *Blob                             `json:"data"`
+	Pointers map[string]map[string]interface{} `json:"pointers"`
+	// TODO(tsileo): handle pagination
+}
+
+func (br *BlobResponse) parsePointers() {
+	fmt.Printf("blob=%+v\n", br.Blob)
+	if ref, ok := br.Pointers[br.Blob.Ref]; ok {
+		br.Blob.File = ref
+		fmt.Printf("f=%+v\n", br.Blob.File)
+	}
 }
 
 func fmtBlobs(blobs []*Blob, shortHashLen int) error {
@@ -729,14 +790,14 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) error {
 	// buf := bytes.Buffer{}
 	index := map[string]string{}
 	for _, blob := range blobs {
-		updated := blob.CreatedAt
-		if blob.UpdatedAt != 0 {
-			updated = blob.UpdatedAt
+		updated, err := blob.Updated()
+		if err != nil {
+			return err
 		}
 		t := "[N] "
-		if blob.Type == "file" {
+		if blob.Kind == "file" {
 			t = "[F] "
-			if d, ok := blob.Ref.(map[string]interface{})["data"]; ok {
+			if d, ok := blob.File["data"]; ok {
 				if e, ok := d.(map[string]interface{})["encrypted"]; ok && e.(bool) {
 					t = "[EF]"
 				}
@@ -747,7 +808,7 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) error {
 			return fmtBlobs(blobs, shortHashLen+1)
 		}
 		index[shortHash] = blob.ID
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", time.Unix(updated, 0).Format("2006-01-02  15:04"), shortHash, t, blob.Title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", updated.Format("2006-01-02  15:04"), shortHash, t, blob.Title)
 	}
 
 	data, err := json.Marshal(index)
@@ -823,9 +884,10 @@ func dataToBlob(data []byte) (*Blob, error) {
 		return nil, fmt.Errorf("failed to parse YAML: %v", err)
 	}
 	return &Blob{
-		Type:     "note",
+		Kind:     "note",
 		Archived: header.Archived,
 		Title:    header.Title,
+		Tags:     header.Tags,
 		Meta:     header.Meta,
 		Content:  string(parts[2]),
 	}, nil
