@@ -31,6 +31,8 @@ import (
 // TODO(tsileo): use JSONPatch, ETag
 // FIXME(tsileo): ability to pipe commands redis-cli like
 
+// TODO(tsileo): kind:binary, data stored in a blob `@blob/embed` => embed base64  data in pointers and allow t ocreate it from STDIN (like saving a commnad output)
+
 // The length of the salt used for scrypt.
 const saltLength = 24
 
@@ -340,7 +342,7 @@ func (*newCmd) Usage() string {
 func (*newCmd) SetFlags(_ *flag.FlagSet) {}
 
 func (n *newCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	out := []byte("---\nupdated: false\ntitle: Untitled\n---\n")
+	out := []byte("---\ntitle: Untitled\ntags: []\narchived: false\n---\n")
 	data, err := toEditor(fmt.Sprintf("%d", time.Now().Unix()), out, true)
 	if err != nil {
 		return rerr("failed to edit blob: %v", err)
@@ -489,6 +491,7 @@ func (u *uploadCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&u.filename, "filename", "", "override the filename (dont't work with bulk uploads)")
 	f.StringVar(&u.prefix, "prefix", "", "prepend the prefix to filenames")
 	f.StringVar(&u.suffix, "suffix", "", "append the suffix to filenames") // XXX(tsileo): check the spelling of suffix?
+	// FIXME(tsileo): allow to set flags via CLI (space-separated)
 }
 
 func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -554,6 +557,7 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 			Title: fname,
 			Kind:  "file",
 			Ref:   "@filetree/ref:" + ref,
+			Tags:  []string{},
 		}
 		_id, err := u.col.Insert(blob, nil)
 		if err != nil {
