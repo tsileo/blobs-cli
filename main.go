@@ -18,7 +18,12 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"a4.io/blobstash/pkg/client/blobstore"
 	"a4.io/blobstash/pkg/client/docstore"
+	"a4.io/blobstash/pkg/client/kvstore"
+	"a4.io/blobstash/pkg/filetree/filetreeutil/meta"
+	"a4.io/blobstash/pkg/filetree/writer"
+
 	"context"
 	"github.com/google/subcommands"
 	"github.com/mitchellh/go-homedir"
@@ -207,7 +212,7 @@ type recentCmd struct {
 }
 
 func (*recentCmd) Name() string     { return "recent" }
-func (*recentCmd) Synopsis() string { return "Display recent blobs" }
+func (*recentCmd) Synopsis() string { return "display recent blobs" }
 func (*recentCmd) Usage() string {
 	return `recent :
 	Display recent blobs.
@@ -238,7 +243,7 @@ type searchCmd struct {
 }
 
 func (*searchCmd) Name() string     { return "search" }
-func (*searchCmd) Synopsis() string { return "Search blobs" }
+func (*searchCmd) Synopsis() string { return "search blobs" }
 func (*searchCmd) Usage() string {
 	return `search <query>:
 	Search blobs.
@@ -279,7 +284,7 @@ type editCmd struct {
 }
 
 func (*editCmd) Name() string     { return "edit" }
-func (*editCmd) Synopsis() string { return "Edit a blob" }
+func (*editCmd) Synopsis() string { return "edit a blob" }
 func (*editCmd) Usage() string {
 	return `edit <id>:
 	Spawn $EDITOR to edit the blob.
@@ -332,7 +337,7 @@ type newCmd struct {
 }
 
 func (*newCmd) Name() string     { return "new" }
-func (*newCmd) Synopsis() string { return "Create a new blob" }
+func (*newCmd) Synopsis() string { return "create a new blob" }
 func (*newCmd) Usage() string {
 	return `new :
 	Create a new blob.
@@ -380,7 +385,7 @@ type downloadCmd struct {
 }
 
 func (*downloadCmd) Name() string     { return "download" }
-func (*downloadCmd) Synopsis() string { return "Download files to the current working directory" }
+func (*downloadCmd) Synopsis() string { return "download files to the current working directory" }
 func (*downloadCmd) Usage() string {
 	return `download <id1 id2 ...> :
 	Download files to the current directory.
@@ -467,19 +472,90 @@ func (d *downloadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface
 
 }
 
+type archiveCmd struct {
+	bs   *blobstore.BlobStore
+	kvs  *kvstore.KvStore
+	col  *docstore.Collection
+	ds   *docstore.DocStore
+	tags string
+}
+
+func (*archiveCmd) Name() string     { return "archive" }
+func (*archiveCmd) Synopsis() string { return "archive the dir/file" }
+func (*archiveCmd) Usage() string {
+	return `archive </path/to/file/or/dir>:
+	Upload the current dir or file as an archive.
+`
+}
+
+func (u *archiveCmd) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&u.tags, "tags", "", "space-separated tags")
+}
+
+func (r *archiveCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	finfo, err := os.Stat(f.Arg(0))
+	switch {
+	case os.IsNotExist(err):
+		return rsuccess("path \"%s\" does not exist", f.Arg(0))
+	case err == nil:
+	default:
+		return rerr("failed to stat file: %v", err)
+	}
+	var m *meta.Meta
+	up := writer.NewUploader(r.bs)
+	// It's a dir
+	if finfo.IsDir() {
+		m, err = up.PutDir(f.Arg(0))
+		if err != nil {
+			return rerr("failed to upload: %v", err)
+		}
+		// FIXME(tsileo): store a FiletreMeta{Hostname, OS} to display (os icon) (hostname) in the web ui
+		// hostname, err := os.Hostname()
+		// if err != nil {
+		// 	return rerr("failed to get hostname: %v", err)
+		// }
+		// FIXME(tsileo): a way to set the hostname?
+	} else {
+		// It's a file
+		m, err = up.PutFile(f.Arg(0))
+		if err != nil {
+			return rerr("failed to upload: %v", err)
+		}
+	}
+	fmt.Printf("meta=%+v", m)
+	tags := strings.SplitN(r.tags, " ", -1)
+
+	blob := &Blob{
+		Title: m.Name,
+		Kind:  "archive",
+		Ref:   "@filetree/ref:" + m.Hash,
+		Tags:  tags,
+	}
+
+	_id, err := r.col.Insert(blob, nil)
+	if err != nil {
+		// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it?
+		return rerr("failed to create blob: %s", err)
+	}
+	fmt.Printf(_id.String())
+
+	return subcommands.ExitSuccess
+}
+
 type uploadCmd struct {
 	encrypt  bool
 	filename string
 	title    string
 	prefix   string
 	suffix   string
+	tags     string
 
 	col *docstore.Collection
 	ds  *docstore.DocStore
 }
 
 func (*uploadCmd) Name() string     { return "upload" }
-func (*uploadCmd) Synopsis() string { return "Upload the given files" }
+func (*uploadCmd) Synopsis() string { return "upload the given files" }
 func (*uploadCmd) Usage() string {
 	return `upload </path/to/file1 /file2 ...>:
 	Upload the given files..
@@ -491,7 +567,7 @@ func (u *uploadCmd) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&u.filename, "filename", "", "override the filename (dont't work with bulk uploads)")
 	f.StringVar(&u.prefix, "prefix", "", "prepend the prefix to filenames")
 	f.StringVar(&u.suffix, "suffix", "", "append the suffix to filenames") // XXX(tsileo): check the spelling of suffix?
-	// FIXME(tsileo): allow to set flags via CLI (space-separated)
+	f.StringVar(&u.tags, "tags", "", "space-separated tags")
 }
 
 func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -509,6 +585,8 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 	if f.NArg() > 1 && (u.filename != "" || u.title != "") {
 		return rerr("-filename and -title cant be used for bulk uploads")
 	}
+
+	tags := strings.SplitN(u.tags, " ", -1)
 
 	for _, path := range f.Args() {
 		var mdata map[string]interface{}
@@ -557,8 +635,9 @@ func (u *uploadCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}
 			Title: fname,
 			Kind:  "file",
 			Ref:   "@filetree/ref:" + ref,
-			Tags:  []string{},
+			Tags:  tags,
 		}
+
 		_id, err := u.col.Insert(blob, nil)
 		if err != nil {
 			// FIXME(tsileo): display the ref of the attachment so a note can be created without re-uploading it?
@@ -575,7 +654,7 @@ type convertCmd struct {
 }
 
 func (*convertCmd) Name() string     { return "convert" }
-func (*convertCmd) Synopsis() string { return "Create a new blob using the file content" }
+func (*convertCmd) Synopsis() string { return "create a new blob using the file content" }
 func (*convertCmd) Usage() string {
 	return `convert <path> <path> <...>:
 	Convert the content of the given files as Blobs.
@@ -623,7 +702,7 @@ type recoverCmd struct {
 }
 
 func (*recoverCmd) Name() string     { return "recover" }
-func (*recoverCmd) Synopsis() string { return "List or recover a Blob" }
+func (*recoverCmd) Synopsis() string { return "list or recover a Blob" }
 func (*recoverCmd) Usage() string {
 	return `recover [<id>]:
 	List or recover a Blob.
@@ -812,7 +891,15 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) error {
 			return fmtBlobs(blobs, shortHashLen+1)
 		}
 		index[shortHash] = blob.ID
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", updated.Format("2006-01-02  15:04"), shortHash, t, blob.Title)
+		var tagsBuffer bytes.Buffer
+		if blob.Tags != nil && len(blob.Tags) > 0 {
+			for _, tag := range blob.Tags {
+				tagsBuffer.WriteString(tag)
+				tagsBuffer.WriteString(", ")
+			}
+		}
+		tags := tagsBuffer.String()
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", updated.Format("2006-01-02  15:04"), shortHash, t, blob.Title, tags[0:len(tags)-2])
 	}
 
 	data, err := json.Marshal(index)
@@ -926,9 +1013,20 @@ func getExpander() (func(string) string, error) {
 
 func main() {
 	// TODO(tsileo) config file with server address and collection name
-	opts := docstore.DefaultOpts().SetHost(os.Getenv("BLOBS_API_HOST"), os.Getenv("BLOBS_API_KEY"))
+	host := os.Getenv("BLOBS_API_HOST")
+	apiKey := os.Getenv("BLOBS_API_KEY")
+	opts := docstore.DefaultOpts().SetHost(host, apiKey)
 	ds := docstore.New(opts)
 	col := ds.Col("notes23")
+
+	bopts := blobstore.DefaultOpts().SetHost(host, apiKey)
+	opts.SnappyCompression = false
+	bs := blobstore.New(bopts)
+	kvopts := kvstore.DefaultOpts().SetHost(host, apiKey)
+	// FIXME(tsileo): have GetJSON support snappy?
+	kvopts.SnappyCompression = false
+
+	kvs := kvstore.New(kvopts)
 
 	var err error
 	// Init cache
@@ -998,6 +1096,12 @@ func main() {
 		expand: expand,
 	}, "")
 	subcommands.Register(&uploadCmd{
+		col: col,
+		ds:  ds,
+	}, "")
+	subcommands.Register(&archiveCmd{
+		bs:  bs,
+		kvs: kvs,
 		col: col,
 		ds:  ds,
 	}, "")
