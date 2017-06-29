@@ -697,99 +697,6 @@ func (c *convertCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 	return subcommands.ExitSuccess
 }
 
-type recoverCmd struct {
-	saveBlob func(*Blob, *Blob) (string, error)
-}
-
-func (*recoverCmd) Name() string     { return "recover" }
-func (*recoverCmd) Synopsis() string { return "list or recover a Blob" }
-func (*recoverCmd) Usage() string {
-	return `recover [<id>]:
-	List or recover a Blob.
-`
-}
-
-func (*recoverCmd) SetFlags(_ *flag.FlagSet) {}
-
-func (r *recoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	// Recover a single Blob
-	if flag.NArg() == 1 {
-		data, err := ioutil.ReadFile(filepath.Join(cache, fmt.Sprintf("blob_%s", flag.Arg(1))))
-		switch {
-		case os.IsNotExist(err):
-			return rerr("no such blob")
-		case err == nil:
-		default:
-			return rerr("failed to read source file: %v", err)
-		}
-
-		data2, err := toEditor(flag.Arg(1), data, false)
-		if err != nil {
-			return rerr("failed to edit blob: %v", err)
-		}
-		updatedBlob, err := dataToBlob(data2.data)
-		if err != nil {
-			return rerr("failed to unserialize blob: %v", err)
-		}
-
-		_id, err := r.saveBlob(updatedBlob, nil)
-		if err != nil {
-			return rerr("failed to save blob: %v", err)
-		}
-
-		// Now we can safely delete the temp file
-		if err := data2.remove(); err != nil {
-			return rerr("failed to remove temporary file: %v", err)
-		}
-
-		fmt.Printf("Blob %s recovered and saved", _id)
-		return subcommands.ExitSuccess
-	}
-
-	// List all blobs available for recovery
-	d, err := os.Open(cache)
-	if err != nil {
-		return rerr("failed to open cache dir: %v", err)
-	}
-	fis, err := d.Readdir(-1)
-	if err != nil {
-		return rerr("failed to read cache dir: %v", err)
-	}
-	buf := &bytes.Buffer{}
-	for _, fi := range fis {
-		if strings.HasPrefix(fi.Name(), "blob_") {
-			data, err := ioutil.ReadFile(filepath.Join(cache, fi.Name()))
-			if err != nil {
-				return rerr("failed to read restore file: %v", err)
-			}
-			blob, err := dataToBlob(data)
-			if err != nil {
-				return rerr("file looks corrupted: %v", err)
-			}
-			blobID := blob.ID
-			// If there's no ID yet, use the timsetamp as ID instead
-			flag := "[N] "
-			if blobID == "" {
-				n := fi.Name()
-				blobID = fi.Name()[5:len(n)]
-				flag = "[UN]"
-			}
-			// TODO(tsileo): tabwriter
-			buf.WriteString(fmt.Sprintf("%s  %s  %s  %s\n", fi.ModTime().Format("2006-01-02  15:04"), blobID, flag, blob.Title))
-		}
-	}
-	fmt.Printf(buf.String())
-	if err := d.Close(); err != nil {
-		return rerr("failed to close cache dir: %v", err)
-	}
-	return subcommands.ExitSuccess
-}
-
-type FileRef struct {
-	Hash string `json:"hash"`
-}
-
-// TODO(tsileo): make Blob.Created() (time.Time, error) / Updated
 type Blob struct {
 	CreatedAt string                 `json:"_created,omitempty" yaml:"-"`
 	Hash      string                 `json:"_hash,omitempty" yaml:"-"`
@@ -885,7 +792,10 @@ func fmtBlobs(blobs []*Blob, shortHashLen int) error {
 					t = "[EF]"
 				}
 			}
+		} else if blob.Kind == "archive" {
+			t = "[A] "
 		}
+
 		shortHash := blob.ID[len(blob.ID)-shortHashLen : len(blob.ID)]
 		if _, ok := index[shortHash]; ok {
 			return fmtBlobs(blobs, shortHashLen+1)
@@ -930,6 +840,8 @@ func toEditor(id string, data []byte, existCheck bool) (*editedBlob, error) {
 	if existCheck {
 		// Ensure we won't overwrite a file that need to be recovered
 		if _, err := os.Stat(fpath); !os.IsNotExist(err) {
+			// FIXME(tsileo): show a warning when the cache file already exists so it can be recovered,
+			// also explain how to do manual recovery
 			return nil, errCacheFileExist
 		}
 	}
@@ -1085,9 +997,6 @@ func main() {
 		saveBlob: saveBlob,
 	}, "")
 	subcommands.Register(&convertCmd{
-		saveBlob: saveBlob,
-	}, "")
-	subcommands.Register(&recoverCmd{
 		saveBlob: saveBlob,
 	}, "")
 	subcommands.Register(&downloadCmd{
