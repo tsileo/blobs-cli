@@ -21,7 +21,7 @@ import (
 	"a4.io/blobstash/pkg/client/blobstore"
 	"a4.io/blobstash/pkg/client/docstore"
 	"a4.io/blobstash/pkg/client/kvstore"
-	"a4.io/blobstash/pkg/filetree/filetreeutil/meta"
+	rnode "a4.io/blobstash/pkg/filetree/filetreeutil/node"
 	"a4.io/blobstash/pkg/filetree/writer"
 
 	"context"
@@ -501,7 +501,7 @@ func (r *archiveCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{
 	default:
 		return rerr("failed to stat file: %v", err)
 	}
-	var m *meta.Meta
+	var m *rnode.RawNode
 	up := writer.NewUploader(r.bs)
 	// It's a dir
 	if finfo.IsDir() {
